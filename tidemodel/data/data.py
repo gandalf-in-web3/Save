@@ -5,7 +5,9 @@
 from abc import ABC, abstractmethod
 from typing import Any, List, Tuple
 
+import h5py
 import numpy as np
+import numpy.typing as npt
 
 
 class Index(ABC):
@@ -73,11 +75,11 @@ class SortedIndex(Index):
         return idx
 
     def index_range(self, start_value: Any, end_value: Any, step: int = 1) -> slice:
-        start: int | None = None
+        start: int = 0
         if start_value is not None:
             start = np.searchsorted(self.data, start_value, side="left")
 
-        stop: int | None = None
+        stop: int = len(self.data)
         if end_value is not None:
             stop = np.searchsorted(self.data, end_value, side="left")
         return slice(start, stop, step)
@@ -111,7 +113,7 @@ class MinuteData:
         minutes: np.ndarray,
         tickers: np.ndarray,
         names: np.ndarray,
-        data: np.ndarray | None = None,
+        data: npt.NDArray | None = None,
     ) -> None:
         self.dates: Index = SortedIndex(dates)
         self.minutes: Index = SortedIndex(minutes)
@@ -122,12 +124,14 @@ class MinuteData:
         )
 
         if data is None:
-            self.data: np.ndarray = np.empty(self.shape, dtype=np.float32)
+            self.data: np.ndarray | HDF5Ndarray = np.empty(
+                self.shape, dtype=np.float32
+            )
         else:
             self.data = data
             assert self.data.shape == self.shape
 
-    def __getitem__(self, slices: slice | Tuple[slice]) -> "MinuteData":
+    def __getitem__(self, value_slices: slice | Tuple[slice]) -> "MinuteData":
         """
         接受四个维度的值索引并返回MinuteData
 
@@ -139,29 +143,66 @@ class MinuteData:
         3. slice(None) 或 值索引列表[ticker1, ticker2...]
         4. slice(None) 或 值索引列表[name1, name2...]
         """
-        if isinstance(slices, slice):
-            slices = (slices, )
-        assert len(slices) <= 4
-        slices = (*slices, *[slice(None) for _ in range(4 - len(slices))])
+        if isinstance(value_slices, slice):
+            value_slices = (value_slices, )
+        assert len(value_slices) <= 4
+        value_slices = (
+            *value_slices,
+            *[slice(None) for _ in range(4 - len(value_slices))]
+        )
 
-        date_slice: slice = self.dates.index_range(
-            slices[0].start, slices[0].stop, slices[0].step,
+        date_idx_slice: slice = self.dates.index_range(
+            value_slices[0].start, value_slices[0].stop, value_slices[0].step,
         )
-        minute_slice: slice = self.minutes.index_range(
-            slices[1].start, slices[1].stop, slices[1].step,
+        minute_idx_slice: slice = self.minutes.index_range(
+            value_slices[1].start, value_slices[1].stop, value_slices[1].step,
         )
-        ticker_slice: List[int] | slice = (
-            slice(None) if slices[2] == slice(None)
-            else self.tickers.index_list(slices[2])
+        ticker_idx_slice: List[int] | slice = (
+            slice(None) if value_slices[2] == slice(None)
+            else self.tickers.index_list(value_slices[2])
         )
-        name_slice: List[int] | slice = (
-            slice(None) if slices[3] == slice(None)
-            else self.names.index_list(slices[3])
+        name_idx_slice: List[int] | slice = (
+            slice(None) if value_slices[3] == slice(None)
+            else self.names.index_list(value_slices[3])
         )
         return MinuteData(
-            dates=self.dates.data[date_slice],
-            minutes=self.minutes.data[minute_slice],
-            tickers=self.tickers.data[ticker_slice],
-            names=self.names.data[name_slice],
-            data=self.data[date_slice, minute_slice, ticker_slice, name_slice],
+            dates=self.dates.data[date_idx_slice],
+            minutes=self.minutes.data[minute_idx_slice],
+            tickers=self.tickers.data[ticker_idx_slice],
+            names=self.names.data[name_idx_slice],
+            data=self.data[
+                date_idx_slice,
+                minute_idx_slice,
+                ticker_idx_slice,
+                name_idx_slice
+            ],
         )
+
+
+class HDF5Ndarray:
+    """
+    由一组已经初始化好的h5py dataset构成的矩阵
+
+    和numpy矩阵一样支持索引返回numpy矩阵
+    """
+
+    def __init__(self, datasets: List[h5py.Dataset]) -> None:
+        self.datasets: List[h5py.Dataset] = datasets
+
+        # 每一个dataset的shape都是(1, n_minute, n_ticker, n_name)
+        self.shape: Tuple[int] = (
+            len(self.datasets), 
+        ) + self.datasets[0].shape[1: ]
+
+    def __getitem__(self, slices: Any) -> np.ndarray | float:
+        """
+        和numpy矩阵完全一致的索引方法
+        """
+        if isinstance(slices[0], int):
+            return self.datasets[slices[0]][0, *slices[1: ]]
+        else:
+            datasets: List[h5py.Dataset] = self.datasets[slices[0]]
+            data: List[float | np.ndarray] = [
+                dataset[0, *slices[1: ]] for dataset in datasets
+            ]
+            return np.stack(data, axis=0)

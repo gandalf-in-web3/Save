@@ -2,10 +2,16 @@
 基于分钟数据计算指标
 """
 
+from typing import Tuple
+
 import numpy as np
 
 from .data import MinuteData
 
+
+"""
+Numpy相关计算函数
+"""
 
 def np_ic(x1: np.ndarray, x2: np.ndarray) -> float:
     """
@@ -19,6 +25,30 @@ def np_ic(x1: np.ndarray, x2: np.ndarray) -> float:
 
     mask: np.ndarray = ~(np.isnan(x1) | np.isnan(x2))
     return np.corrcoef(x1[mask], x2[mask])[0, 1]
+
+
+def np_long_ic(
+    x1: np.ndarray,
+    x2: np.ndarray,
+    mean: bool = True,
+) -> float | np.ndarray:
+    """
+    计算两个多维矩阵的皮尔逊相关系数
+
+    除最后一维外视作计算一个ic点的序列
+
+    自动忽略nan
+    """
+
+    assert x1.shape == x2.shape
+
+    ics: np.ndarray = np.zeros(x1.shape[-1], dtype=np.float32)
+    for idx in range(x1.shape[-1]):
+        ics[idx] = np_ic(x1[..., idx].reshape(-1), x2[..., idx].reshape(-1))
+
+    if mean:
+        return np.nanmean(ics)
+    return ics
 
 
 def np_cross_ic(
@@ -36,7 +66,7 @@ def np_cross_ic(
 
     assert x1.shape == x2.shape
 
-    ics = np.zeros(x1.shape[: -1], dtype=np.float32)
+    ics: np.ndarray = np.zeros(x1.shape[: -1], dtype=np.float32)
     for idx in np.ndindex(x1.shape[:-1]):
         ics[idx] = np_ic(x1[idx], x2[idx])
 
@@ -54,8 +84,7 @@ def np_mr(x1: np.ndarray, x2: np.ndarray) -> float:
     assert x2.shape == x1.shape
 
     x1_mask: np.ndarray = ~np.isnan(x1)
-    mask: np.ndarray = x1_mask & np.isnan(x2)
-    return np.sum(mask) / np.sum(x1_mask)
+    return (x1_mask & np.isnan(x2)).sum() / x1_mask.sum()
 
 
 def np_cross_norm(x: np.ndarray, axis: int) -> np.ndarray:
@@ -67,7 +96,32 @@ def np_cross_norm(x: np.ndarray, axis: int) -> np.ndarray:
 
     mean: np.ndarray = np.nanmean(x, axis=axis, keepdims=True)
     std: np.ndarray = np.nanstd(x, axis=axis, keepdims=True)
-    return (x - mean) / (std + 1e-8)
+    return (x - mean) / std
+
+
+"""
+MinuteData相关计算函数
+
+底层均基于numpy计算
+"""
+
+
+def long_ic(
+    x1: MinuteData,
+    x2: MinuteData,
+    mean: bool = True,
+) -> np.ndarray | float:
+    """
+    计算两个分钟频数据的时序IC
+    """
+    assert x1.shape[-1] == 1
+    assert x2.shape[-1] == 1
+
+    return np_long_ic(
+        x1=x1.data.squeeze(-1),
+        x2=x2.data.squeeze(-1),
+        mean=mean,
+    )
 
 
 def cross_ic(
@@ -89,12 +143,12 @@ def cross_ic(
     )
 
 
-def mr(x1: MinuteData, x2: MinuteData) -> float:
+def mr(x1: MinuteData, x2: MinuteData,) -> float:
     """
-    计算x2在x1上的缺失率
+    计算两个分钟频数据的缺失率
     """
 
-    return np_mr(x1.data, x2.data)
+    return np_mr(x1.data.reshape(-1), x2.data.reshape(-1))
 
 
 def cross_norm(x: MinuteData) -> MinuteData:

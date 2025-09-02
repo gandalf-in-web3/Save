@@ -1,14 +1,14 @@
 """
-模型数据集
+数据集
 """
 
-from typing import Any, Dict, List, Literal, Tuple, Union
+from typing import Any, Dict, List, Union
 
 import torch
 import numpy as np
 from torch.utils.data import Dataset
 
-from ..data import MinuteData
+from ..data import HDF5MinuteDataBase, MinuteData, cross_norm
 
 
 def collate_fn(
@@ -57,11 +57,9 @@ def load_to_device(
             data[k] = data[k].to(device, non_blocking=True)
 
 
-class Matrix4DDataset(Dataset):
+class BinMinuteDataset(Dataset):
     """
-    从四维矩阵构建数据集
-    x: (n_dt, n_step, n_ticker, n_x)
-    y: (n_dt, n_step, n_ticker)
+    基于二进制数据库构建数据集
 
     尽量避免对矩阵有过多的操作, 原因如下:
     1. 矩阵占用内存高, 直接操作内存和耗时都会爆炸
@@ -70,32 +68,184 @@ class Matrix4DDataset(Dataset):
 
     def __init__(
         self,
-        data: MinuteData,
-        slice_tuple: Tuple[slice],
+        whole_x: MinuteData,
+        whole_y: MinuteData,
+        start_dt: np.datetime64 | None,
+        end_dt: np.datetime64 | None,
+        start_minute: int | None,
+        end_minute: int | None,
+        cross_norm_y: bool = False,
+        seq_len: int | None = None,
     ) -> None:
-        self.data: MinuteData = data
-
-        self.mask: np.bool = np.zeros(, dtype=bool)
-
-        self.dt_mask = self.x_loader.y_loader.get_dt_mask(
-            mode=mode,
-            open=False,
-            slice=False,
+        self._load_x_and_y(
+            whole_x=whole_x,
+            whole_y=whole_y,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            start_minute=start_minute,
+            end_minute=end_minute,
+            cross_norm_y=cross_norm_y,
+            seq_len=seq_len,
         )
-        self.indexes: np.ndarray = np.where(self.dt_mask)[0]
-        self._init: bool = False
 
+        self.seq_len: int | None = seq_len
+
+    def _load_x_and_y(
+        self,
+        whole_x: MinuteData,
+        whole_y: MinuteData,
+        start_dt: np.datetime64 | None,
+        end_dt: np.datetime64 | None,
+        start_minute: int | None,
+        end_minute: int | None,
+        cross_norm_y: bool = False,
+    ) -> None:
+        """
+        根据整个x和y矩阵计算y, y_pred和index
+        """
+        self.whole_x: MinuteData = whole_x
+        self.whole_y: MinuteData = whole_y
+        if cross_norm_y:
+            self.whole_y = cross_norm(self.whole_y)
+
+        self.y: MinuteData = self.whole_y[
+            slice(start_dt, end_dt),
+            slice(start_minute, end_minute)
+        ]
+        self.y_pred: MinuteData = MinuteData(
+            dates=self.y.dates.data,
+            minutes=self.y.minutes.data,
+            tickers=self.y.tickers.data,
+            names=self.y.names.data,
+        )
+
+        dt_slice: slice = self.whole_y.dates.index_range(
+            start_dt, end_dt
+        )
+        self.dt_indexes = list(range(len(self.whole_y.dates)))[dt_slice]
+
+        minute_slice: slice = self.whole_y.minutes.index_range(
+            start_minute, end_minute
+        )
+        self.minute_indexes = list(range(len(
+            self.whole_y.minutes
+        )))[minute_slice]
+    
     def __len__(self) -> int:
-        return len(self.indexes)
+        return len(self.dt_indexes) * len(self.minute_indexes)
 
     def __getitem__(self, idx: int) -> Dict[str, np.ndarray]:
-        if not self._init:
-            self.data.load()
-            self._init = True
+        idx0: int = self.dt_indexes[idx // len(self.minute_indexes)]
+        idx1: int = self.minute_indexes[idx % len(self.minute_indexes)]
 
-        data_idx: int = self.indexes[idx]
+        # 非时序数据返回数据是(n, ...)
+        if self.seq_len is None:
+            return {
+                "x": self.whole_x.data[idx0, idx1],
+                "y": self.whole_y.data[idx0, idx1],
+                "idx": np.array([idx, ], np.int64),
+                "minute": np.array([idx1, ], np.int64),
+            }
+        
+        # 时序数据返回数据是(t, n, ...)
+        x: np.ndarray = self.whole_x.data[
+            idx0, max(idx1 - self.seq_len, 0.0): idx1
+        ]
+        y: np.ndarray = self.whole_y.data[
+            idx0, max(idx1 - self.seq_len, 0.0): idx1
+        ]
+
+        # 如果不够则需要从前一日补齐
+        if x.shape[0] < self.seq_len:
+            assert idx0 >= 1, "can't get yesterday sequence data"
+
+            n_pad: int = self.seq_len - x.shape[0]
+            pad_x: np.ndarray = self.whole_x.data[idx0 - 1, -n_pad: ]
+            pad_y: np.ndarray = self.whole_y.data[idx0 - 1, -n_pad: ]
+
         return {
-            "x": self.x_loader.x[data_idx],
-            "y": self.x_loader.y_loader.y[data_idx],
-            "idx": np.array([data_idx, ], np.int64),
+            "x": np.concatenate([pad_x, x], axis=0),
+            "y": np.concatenate([pad_y, y], axis=0),
+            "idx": np.array([idx, ], np.int64),
         }
+
+
+class HDF5MinuteDataset(BinMinuteDataset):
+    """
+    基于HDF5分钟数据库构建数据集
+
+    无需主动调用load, 在第一次访问时会自动load
+    """
+
+    def __init__(
+        self,
+        hdf5_db: HDF5MinuteDataBase,
+        y_names: str | List[str],
+        x_names: List[str] | slice = slice(None),
+        start_dt: np.datetime64 | None = None,
+        end_dt: np.datetime64 | None = None,
+        start_minute: int | None = None,
+        end_minute: int | None = None,
+        cross_norm_y: bool = False,
+        seq_len: int | None = None,
+    ) -> None:
+        self.hdf5_db = hdf5_db
+        self.x_names: List[str] | slice = x_names
+        self.y_names: str | List[str] = y_names
+        self.start_dt: np.datetime64 | None = start_dt
+        self.end_dt: np.datetime64 | None = end_dt
+        self.start_minute: int | None = start_minute
+        self.end_minute: int | None = end_minute
+        self.cross_norm_y: bool = cross_norm_y
+        self.seq_len: int | None = seq_len
+
+        # 数据, y常用于评估
+        self.whole_x: MinuteData = None
+        self.whole_y: MinuteData = None
+        self.y: MinuteData = None
+        self.dt_indexes: List[int] = None
+        self.minute_indexes: List[int] = None
+
+        self._load: bool = False
+
+    def load(self, ) -> None:
+        """
+        初始化hdf5句柄, 加载数据
+        """
+        whole_x, whole_y = self.hdf5_db.read_dataset_lazy(
+            self.y_names
+        )
+        
+        self._load_x_and_y(
+            whole_x=whole_x,
+            whole_y=whole_y,
+            start_dt=self.start_dt,
+            end_dt=self.end_dt,
+            start_minute=self.start_minute,
+            end_minute=self.end_minute,
+            cross_norm_y=self.cross_norm_y,
+        )
+
+        # 提前计算因子名索引
+        self.name_idx_slice: slice = whole_x.names.index_range(self.x_names)
+
+        self._load = True
+
+    def __len__(self) -> int:
+        if not self._load:
+            self.load()
+
+        return super().__len__()
+
+    def __getitem__(self, idx: int) -> Dict[str, np.ndarray]:
+        if not self._load:
+            self.load()
+
+        data: Dict[str, np.ndarray] = super().__getitem__(idx)
+
+        # 根据选择的因子名对数据索引
+        if self.seq_len is None:
+            data["x"] = data["x"][:, self.name_idx_slice]
+        else:
+            data["x"] = data["x"][:, :, self.name_idx_slice]
+        return data
