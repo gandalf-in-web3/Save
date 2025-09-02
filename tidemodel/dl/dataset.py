@@ -2,7 +2,7 @@
 数据集
 """
 
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Tuple, Union
 
 import torch
 import numpy as np
@@ -146,7 +146,7 @@ class BinMinuteDataset(Dataset):
                 "idx": np.array([idx, ], np.int64),
                 "minute": np.array([idx1, ], np.int64),
             }
-        
+
         # 时序数据返回数据是(t, n, ...)
         x: np.ndarray = self.whole_x.data[
             idx0, max(idx1 - self.seq_len, 0.0): idx1
@@ -227,7 +227,10 @@ class HDF5MinuteDataset(BinMinuteDataset):
         )
 
         # 提前计算因子名索引
-        self.name_idx_slice: slice = whole_x.names.index_range(self.x_names)
+        if self.x_names == slice(None):
+            self.name_idx_slice: slice | Tuple[int] = slice(None)
+        else:
+            self.name_idx_slice = whole_x.names.index_list(self.x_names)
 
         self._load = True
 

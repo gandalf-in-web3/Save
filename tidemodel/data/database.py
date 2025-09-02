@@ -18,7 +18,7 @@ from tqdm.auto import tqdm
 
 from .data import HDF5Ndarray, MinuteData, SortedIndex
 from .ops import cross_ic, long_ic, mr
-from ..utils import read_txt, validate_float_to_int, write_txt
+from ..utils import validate_float_to_int, write_txt
 
 
 """
@@ -530,7 +530,7 @@ class StatsDataBase:
         """
         返回指定因子的指标
         """
-        return self.df[col].loc[x_names].to_numpy()
+        return self.df[col].loc[x_names].to_numpy().astype(np.float32)
 
 
 """
@@ -742,7 +742,7 @@ def build_norm_stats_db(
             except Exception as e:
                 print(f"Error {e}")
     
-    stats_df: pd.DataFrame = pd.DataFrame(x_stats, index=x_names)
+    stats_df = pd.DataFrame(x_stats, index=x_names, dtype=np.float32)
     stats_df.to_csv(to_file)
 
 
@@ -814,5 +814,5 @@ def build_selection_stats_db(
             except Exception as e:
                 print(f"Error: {e}")
 
-    stats_df = pd.DataFrame(x_stats, index=x_names)
+    stats_df = pd.DataFrame(x_stats, index=x_names, dtype=np.float32)
     stats_df.to_csv(to_file)

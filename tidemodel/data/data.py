@@ -117,8 +117,8 @@ class MinuteData:
     ) -> None:
         self.dates: Index = SortedIndex(dates)
         self.minutes: Index = SortedIndex(minutes)
-        self.tickers: Index = SortedIndex(tickers)
-        self.names: Index = SortedIndex(names)
+        self.tickers: Index = UniqueIndex(tickers)
+        self.names: Index = UniqueIndex(names)
         self.shape: Tuple[int] = (
             len(dates), len(minutes), len(tickers), len(names)
         )

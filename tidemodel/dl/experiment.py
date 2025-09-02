@@ -6,7 +6,7 @@ import logging
 import os
 import shutil
 from abc import ABC, abstractmethod
-from collections import OrderedDict, defaultdict
+from collections import defaultdict
 from functools import partial
 from typing import Any, Callable, Dict, List, Tuple
 
@@ -56,10 +56,6 @@ class LossAggregator:
 class DLExperiment(ABC):
     """
     基于Accelerate编写的模型实验基类
-
-    1. Dataloader开启persistent_workers
-    2. 验证集使用的进程数是训练集的一半
-    3. AdamW优化器
     """
 
     config: Dict[str, Any] = {
@@ -75,7 +71,6 @@ class DLExperiment(ABC):
 
         "epoch": 100,
         "clip_norm": float("inf"),
-        
         "n_valid_per_epoch": 1,
     }
 
@@ -203,23 +198,24 @@ class DLExperiment(ABC):
         self,
         dataset: Dataset,
         output: Dict[str, torch.Tensor],
-    ) -> OrderedDict[str, torch.Tensor]:
+    ) -> Dict[str, torch.Tensor]:
         """
         计算指标
 
         返回一个metric字典
 
-        默认使用ic作为评估指标
+        默认使用ic作为评估指标, 包含整体IC, 前30分钟和前90分钟IC
         """
         dataset.y_pred.data = output["y_pred"].detach().numpy().reshape(
             dataset.y_pred.shape
         )
         cross_ics: np.ndarray = cross_ic(dataset.y, dataset.y_pred, mean=False)
+        min30_idx_slice: slice = dataset.y.minutes.index_range(None, 30)
+        min90_idx_slice: slice = dataset.y.minutes.index_range(None, 90)
         return {
             "cross_ic": np.mean(cross_ics),
-            "cross_ic30": np.mean(cross_ics[:, : 30]),
-            "cross_ic90": np.mean(cross_ics[:, : 90]),
-            "cross_ic120": np.mean(cross_ics[:, : 120]),
+            "cross_ic30": np.mean(cross_ics[:, min30_idx_slice]),
+            "cross_ic90": np.mean(cross_ics[:, min90_idx_slice]),
         }
 
     def train(self, ) -> None:
@@ -463,9 +459,12 @@ class HDF5DLExperiment(DLExperiment):
 
         "bin_folder": None,
         "hdf5_folder": None,
+        
+        "x_names": slice(None),
         "y_names": None,
         "start_minute": None,
         "end_minute": None,
+        "seq_len": None,
 
         "train_start_dt": None,
         "train_end_dt": None,
@@ -482,16 +481,19 @@ class HDF5DLExperiment(DLExperiment):
         hdf5_db = HDF5MinuteDataBase(
             self.config["hdf5_folder"], self.config["bin_folder"]
         )
-        self.x_min: np.ndarray = hdf5_db.read_stats("x_05")
-        self.x_median: np.ndarray = hdf5_db.read_stats("x_50")
-        self.x_max: np.ndarray = hdf5_db.read_stats("x_995")
+        if self.config["x_names"] == slice(None):
+            self.x_names: List[str] = hdf5_db.names
+        else:
+            self.x_names = self.config["x_names"]
 
         dataset_cls: Callable = partial(
             HDF5MinuteDataset,
             hdf5_db=hdf5_db,
+            x_names=self.config["x_names"],
             y_names=self.config["y_names"],
             start_minute=self.config["start_minute"],
             end_minute=self.config["end_minute"],
+            seq_len=self.config["seq_len"],
         )
         self.train_dataset = dataset_cls(
             start_dt=self.config["train_start_dt"],
