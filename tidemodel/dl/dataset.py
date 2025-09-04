@@ -2,6 +2,7 @@
 数据集
 """
 
+import itertools
 from typing import Any, Dict, List, Tuple, Union
 
 import torch
@@ -74,8 +75,9 @@ class BinMinuteDataset(Dataset):
         end_dt: np.datetime64 | None,
         start_minute: int | None,
         end_minute: int | None,
-        cross_norm_y: bool = False,
+        stride: int = 1,
         seq_len: int | None = None,
+        cross_norm_y: bool = False,
     ) -> None:
         self._load_x_and_y(
             whole_x=whole_x,
@@ -85,9 +87,9 @@ class BinMinuteDataset(Dataset):
             start_minute=start_minute,
             end_minute=end_minute,
             cross_norm_y=cross_norm_y,
-            seq_len=seq_len,
         )
 
+        self.stride: int = stride
         self.seq_len: int | None = seq_len
 
     def _load_x_and_y(
@@ -110,7 +112,7 @@ class BinMinuteDataset(Dataset):
 
         self.y: MinuteData = self.whole_y[
             slice(start_dt, end_dt),
-            slice(start_minute, end_minute)
+            slice(start_minute, end_minute, self.stride)
         ]
         self.y_pred: MinuteData = MinuteData(
             dates=self.y.dates.data,
@@ -125,18 +127,22 @@ class BinMinuteDataset(Dataset):
         self.dt_indexes = list(range(len(self.whole_y.dates)))[dt_slice]
 
         minute_slice: slice = self.whole_y.minutes.index_range(
-            start_minute, end_minute
+            start_minute, end_minute, self.stride
         )
         self.minute_indexes = list(range(len(
             self.whole_y.minutes
         )))[minute_slice]
-    
+
+        self.indexes: List[Tuple[int, int]] = list(
+            itertools.product(self.dt_indexes, self.minute_indexes)
+        )
+
     def __len__(self) -> int:
-        return len(self.dt_indexes) * len(self.minute_indexes)
+        return len(self.indexes)
 
     def __getitem__(self, idx: int) -> Dict[str, np.ndarray]:
-        idx0: int = self.dt_indexes[idx // len(self.minute_indexes)]
-        idx1: int = self.minute_indexes[idx % len(self.minute_indexes)]
+        idx0: int = self.indexes[idx][0]
+        idx1: int = self.indexes[idx][1]
 
         # 非时序数据返回数据是(n, ...)
         if self.seq_len is None:
@@ -144,28 +150,31 @@ class BinMinuteDataset(Dataset):
                 "x": self.whole_x.data[idx0, idx1],
                 "y": self.whole_y.data[idx0, idx1],
                 "idx": np.array([idx, ], np.int64),
-                "minute": np.array([idx1, ], np.int64),
             }
 
         # 时序数据返回数据是(t, n, ...)
-        x: np.ndarray = self.whole_x.data[
-            idx0, max(idx1 - self.seq_len, 0.0): idx1
-        ]
-        y: np.ndarray = self.whole_y.data[
-            idx0, max(idx1 - self.seq_len, 0.0): idx1
-        ]
+        # 计算用到的indxes
+        idxes: List[int] = list(range(
+            max(idx1 - self.seq_len + 1, 0), idx1 + 1
+        ))
+        if len(idxes) < self.seq_len:
+            n_pad: int = self.seq_len - len(idxes)
+            idxes = list(range(-n_pad, 0, 1)) + idxes
 
-        # 如果不够则需要从前一日补齐
-        if x.shape[0] < self.seq_len:
-            assert idx0 >= 1, "can't get yesterday sequence data"
+        # 获取当日数据
+        td_idxes: List[int] = [idx for idx in idxes if idx >= 0]
+        x: np.ndarray = self.whole_x.data[idx0, td_idxes]
 
-            n_pad: int = self.seq_len - x.shape[0]
-            pad_x: np.ndarray = self.whole_x.data[idx0 - 1, -n_pad: ]
-            pad_y: np.ndarray = self.whole_y.data[idx0 - 1, -n_pad: ]
+        # 不够则需要从昨日数据补齐
+        yd_idxes: List[int] = [idx for idx in idxes if idx < 0]
+        if len(yd_idxes) > 0:
+            assert idx0 >= 1, f"can't get yesterday data"
+            yd_x: np.ndarray = self.whole_x.data[idx0 - 1, yd_idxes]
+            x = np.concatenate([yd_x, x], axis=0)
 
         return {
-            "x": np.concatenate([pad_x, x], axis=0),
-            "y": np.concatenate([pad_y, y], axis=0),
+            "x": x,
+            "y": self.whole_y.data[idx0, idx1],
             "idx": np.array([idx, ], np.int64),
         }
 
@@ -186,8 +195,9 @@ class HDF5MinuteDataset(BinMinuteDataset):
         end_dt: np.datetime64 | None = None,
         start_minute: int | None = None,
         end_minute: int | None = None,
-        cross_norm_y: bool = False,
+        stride: int = 1,
         seq_len: int | None = None,
+        cross_norm_y: bool = False,
     ) -> None:
         self.hdf5_db = hdf5_db
         self.x_names: List[str] | slice = x_names
@@ -196,8 +206,9 @@ class HDF5MinuteDataset(BinMinuteDataset):
         self.end_dt: np.datetime64 | None = end_dt
         self.start_minute: int | None = start_minute
         self.end_minute: int | None = end_minute
-        self.cross_norm_y: bool = cross_norm_y
+        self.stride: int = stride
         self.seq_len: int | None = seq_len
+        self.cross_norm_y: bool = cross_norm_y
 
         # 数据, y常用于评估
         self.whole_x: MinuteData = None
@@ -215,7 +226,7 @@ class HDF5MinuteDataset(BinMinuteDataset):
         whole_x, whole_y = self.hdf5_db.read_dataset_lazy(
             self.y_names
         )
-        
+
         self._load_x_and_y(
             whole_x=whole_x,
             whole_y=whole_y,

@@ -464,6 +464,7 @@ class HDF5DLExperiment(DLExperiment):
         "y_names": None,
         "start_minute": None,
         "end_minute": None,
+        "stride": 1,
         "seq_len": None,
 
         "train_start_dt": None,
@@ -478,6 +479,7 @@ class HDF5DLExperiment(DLExperiment):
         """
         从HDF5数据库中加载数据
         """
+
         hdf5_db = HDF5MinuteDataBase(
             self.config["hdf5_folder"], self.config["bin_folder"]
         )
@@ -495,20 +497,26 @@ class HDF5DLExperiment(DLExperiment):
             end_minute=self.config["end_minute"],
             seq_len=self.config["seq_len"],
         )
+
         self.train_dataset = dataset_cls(
             start_dt=self.config["train_start_dt"],
             end_dt=self.config["train_end_dt"],
+            stride=self.config["stride"],
         )
         self.valid_dataset = dataset_cls(
             start_dt=self.config["valid_start_dt"],
             end_dt=self.config["valid_end_dt"],
+            stride=self.config["stride"],
         )
+
+        # 测试时步长必须为1
         self.test_dataset = dataset_cls(
             start_dt=self.config["test_start_dt"],
             end_dt=self.config["test_end_dt"],
+            stride=1,
         )
-        self.logger.info(
-            f"{len(self.train_dataset)} train, "
-            f"{len(self.valid_dataset)} valid, "
-            f"{len(self.test_dataset)} test"
-        )
+        # self.logger.info(
+        #     f"{len(self.train_dataset)} train, "
+        #     f"{len(self.valid_dataset)} valid, "
+        #     f"{len(self.test_dataset)} test"
+        # )

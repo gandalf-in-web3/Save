@@ -13,3 +13,6 @@ iostat -xz -m -y 1
 
 # 监控某个进程的IO, KB_rd/s代表从磁盘读取
 pidstat -d 1 -p $pid
+
+# 监控系统IO
+sudo iotop -o -P

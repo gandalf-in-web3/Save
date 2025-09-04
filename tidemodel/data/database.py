@@ -399,7 +399,7 @@ class HDF5MinuteDataBase:
         def read_and_assign(i: int) -> None:
             with h5py.File(os.path.join(
                 self.folder, f"{np.datetime_as_string(dates[i], unit='D')}.h5"
-            ), 'r') as f:
+            ), 'r', locking=False) as f:
                 x.data[i: i + 1] = MinuteData(
                     dates=np.array([dates[i], ]),
                     minutes=self.bin_db.minutes,
@@ -465,7 +465,7 @@ class HDF5MinuteDataBase:
         def read_and_assign(i: int) -> None:
             with h5py.File(os.path.join(
                 self.folder, f"{np.datetime_as_string(dates[i], unit='D')}.h5"
-            ), 'r') as f:
+            ), 'r', locking=False) as f:
                 x: MinuteData = MinuteData(
                     dates=np.array([dates[i], ]),
                     minutes=self.bin_db.minutes,
@@ -504,7 +504,7 @@ class HDF5MinuteDataBase:
         # 懒加载x, 将dataset组合成HDF5Ndarray
         self.handles: List[h5py.File] = [
             h5py.File(
-                os.path.join(self.folder, file), 'r'
+                os.path.join(self.folder, file), 'r', locking=False
             ) for file in self.files
         ]
 
