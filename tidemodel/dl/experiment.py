@@ -2,13 +2,12 @@
 模型训练, 测试和导出
 """
 
+import copy
 import logging
 import os
 import shutil
-from abc import ABC, abstractmethod
 from collections import defaultdict
-from functools import partial
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import accelerate
 import torch
@@ -20,10 +19,11 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 
-from .callback import Callback, CallbackManager
-from .dataset import HDF5MinuteDataset, collate_fn
+from .callback import Callback, CallbackManager, EarlyStopSaver
+from .dataset import collate_fn
 from .ops import cross_ic_loss
-from ..data import HDF5MinuteDataBase, cross_ic
+from ..data import MinuteData, cross_ic
+from ..ml import Experiment
 from ..utils import DummyClass, get_logger, get_newest_ckpt, reset_logger
 
 
@@ -53,43 +53,41 @@ class LossAggregator:
             self.loss[k] += (v.item() - self.loss[k]) / self.num
 
 
-class DLExperiment(ABC):
+class DLExperiment(Experiment):
     """
-    基于Accelerate编写的模型实验基类
+    基于Accelerate的深度学习实验基类
     """
 
-    config: Dict[str, Any] = {
+    params: Dict[str, Any] = {
         "seed": 42,
-        "folder": None,
-        "create_folder": True,
 
         "lr": 0.001,
-        "weight_decay": 0.001,
+        "weight_decay": 0.0,
 
         "batch_size": 128,
         "n_worker": 4,
 
         "epoch": 100,
-        "clip_norm": float("inf"),
+        "clip_norm": 5.0,
+    
         "n_valid_per_epoch": 1,
+        "metric_name": "cross_ic",
+        "patience": 5,
     }
 
     def __init__(
         self,
-        config: Dict[str, Any],
+        folder: str,
+        create_folder: bool = True,
         callbacks: List[Callback] = [],
+        params: Dict[str, Any] = {},
     ) -> None:
-        _config = self.config.copy()
-        _config.update(config)
-        self.config = _config
-        
-        # 注册回调
-        self.callback = CallbackManager(self)
-        for cb in callbacks:
-            self.callback.add(cb)
+        _params = self.params.copy()
+        _params.update(params)
+        self.params = _params
 
         # 初始化accelerator
-        accelerate.utils.set_seed(self.config["seed"])
+        accelerate.utils.set_seed(self.params["seed"])
         self.accelerator = Accelerator(
             dataloader_config=accelerate.utils.DataLoaderConfiguration(
                 non_blocking=True
@@ -97,9 +95,36 @@ class DLExperiment(ABC):
         )
 
         # 初始化文件夹
-        self._init_folder()
+        self.folder: str = folder
+        if self.accelerator.is_main_process:
+            if create_folder:
+                # 创建文件夹
+                if os.path.exists(folder):
+                    shutil.rmtree(folder, ignore_errors=True)
+                os.makedirs(folder)
+
+            self.logger: logging.Logger = get_logger(folder)
+            self.logger.info(f"params are {self.params}")
+
+            self.writer = SummaryWriter(folder)
+        else:
+            self.logger = DummyClass()
+            self.writer = DummyClass()
+    
+        # 注册回调
+        self.callback = CallbackManager(self)
+        self.callback.add(EarlyStopSaver(
+            metric_name=self.params["metric_name"],
+            patience=self.params["patience"],
+        ))
+
+        for cb in callbacks:
+            self.callback.add(cb)
 
         # 数据
+        self.x_names: List[str] = None
+        self.y_names: List[str] = None
+
         self.train_dataset: Dataset | None = None
         self.valid_dataset: Dataset | None = None
         self.test_dataset: Dataset | None = None
@@ -121,25 +146,6 @@ class DLExperiment(ABC):
         self.output: Dict[str, torch.Tensor] = {}
         self.metric: Dict[str, torch.Tensor] = {}
 
-    def _init_folder(self, ) -> None:
-        """
-        创建文件夹, 日志和tensorboard
-        """
-        if self.accelerator.is_main_process:
-            if self.config["create_folder"]:
-                # 创建文件夹
-                if os.path.exists(self.config["folder"]):
-                    shutil.rmtree(self.config["folder"], ignore_errors=True)
-                os.makedirs(self.config["folder"])
-
-            self.logger: logging.Logger = get_logger(self.config["folder"])
-            self.logger.info(f"config is {self.config}")
-
-            self.writer = SummaryWriter(self.config["folder"])
-        else:
-            self.logger = DummyClass()
-            self.writer = DummyClass()
-
     def _record(self, value: Dict[str, Any], prefix: str) -> None:
         """
         将一个字典的值写入到log和tensorboard中
@@ -149,34 +155,30 @@ class DLExperiment(ABC):
         for k, v in value.items():
             self.writer.add_scalar(f"{prefix}_{k}", v, self.step)
 
-    @abstractmethod
-    def load_data(self, ) -> None:
+    def get_model(self, ) -> nn.Module:
         """
-        加载Dataset
+        获取原始module
         """
-        pass
+        return self.model.module if hasattr(
+            self.model, "module"
+        ) else self.model
 
-    @abstractmethod
-    def build_model(self, ) -> nn.Module:
-        """
-        构造并返回模型
-
-        模型的forward函数返回一个字典, 其中y_pred键值为最终预测值
-        """
-        pass
-    
-    def build_optimizer(self, ) -> Optimizer:
-        """
-        构造并返回优化器
-
-        默认使用Adam优化器
-        """
-        return torch.optim.AdamW(
-            self.model.parameters(),
-            lr=self.config["lr"],
-            weight_decay=self.config["weight_decay"],
-        )
-    
+    def load_data(
+        self,
+        x_names: List[str],
+        y_names: str | List[str],
+        train_dataset: Dataset | None = None,
+        valid_dataset: Dataset | None = None,
+        test_dataset: Dataset | None = None,
+    ) -> None:
+        self.x_names: List[str] = x_names
+        self.y_names: List[str] = [y_names, ] if isinstance(
+            y_names, str
+        ) else y_names
+        self.train_dataset: Dataset = train_dataset
+        self.valid_dataset: Dataset = valid_dataset
+        self.test_dataset: Dataset = test_dataset
+        
     def loss_func(
         self,
         data: Dict[str, torch.Tensor],
@@ -189,6 +191,9 @@ class DLExperiment(ABC):
 
         默认使用单label cross ic loss
         """
+        if hasattr(self.get_model(), "loss_func"):
+            return self.get_model().loss_func(data, output)
+
         return {"loss": cross_ic_loss(
             data["y"].squeeze(-1),
             output["y_pred"].squeeze(-1)
@@ -204,52 +209,56 @@ class DLExperiment(ABC):
 
         返回一个metric字典
 
-        默认使用ic作为评估指标, 包含整体IC, 前30分钟和前90分钟IC
+        默认使用整体ic作为评估指标
         """
-        dataset.y_pred.data = output["y_pred"].detach().numpy().reshape(
-            dataset.y_pred.shape
+        if hasattr(self.get_model(), "metric_func"):
+            return self.get_model().metric_func(dataset, output)
+        
+        y_pred: MinuteData = copy.copy(dataset.y)
+        y_pred.data = output["y_pred"].detach().numpy().reshape(
+            dataset.y.shape
         )
-        cross_ics: np.ndarray = cross_ic(dataset.y, dataset.y_pred, mean=False)
-        min30_idx_slice: slice = dataset.y.minutes.index_range(None, 30)
-        min90_idx_slice: slice = dataset.y.minutes.index_range(None, 90)
-        return {
-            "cross_ic": np.mean(cross_ics),
-            "cross_ic30": np.mean(cross_ics[:, min30_idx_slice]),
-            "cross_ic90": np.mean(cross_ics[:, min90_idx_slice]),
-        }
+        return {"cross_ic": cross_ic(dataset.y, y_pred)}
 
-    def train(self, ) -> None:
+    def train(
+        self,
+        model: nn.Module,
+        optimizer: Optimizer | None = None,
+    ) -> None:
         """
         训练
         """
         torch.cuda.empty_cache()
 
-        self.model = self.build_model()
-        self.optimizer = self.build_optimizer()
+        self.model = model
+        self.optimizer = optimizer
+        if self.optimizer is None:
+            self.optimizer = torch.optim.AdamW(
+                self.model.parameters(),
+                lr=self.params["lr"],
+                weight_decay=self.params["weight_decay"],
+            )
 
+        dataloader_config: Dict[str, Any] = {
+            "batch_size": self.params["batch_size"],
+            "collate_fn": collate_fn,
+            "num_workers": self.params["n_worker"],
+            "pin_memory": True,
+        }
         # 对于rdma挂载不预取更稳定
+        if dataloader_config["num_workers"] > 0:
+            dataloader_config["prefetch_factor"] = 1
+            dataloader_config["persistent_workers"] = True
+
         self.train_dataloader = DataLoader(
             self.train_dataset,
-            batch_size=self.config["batch_size"],
             shuffle=True,
-            collate_fn=collate_fn,
-            num_workers=self.config["n_worker"],
-            prefetch_factor=1,
-            persistent_workers=True,
-            pin_memory=True,
             drop_last=True,
+            **dataloader_config,
         )
-
         self.valid_dataloader = DataLoader(
             self.valid_dataset,
-            batch_size=self.config["batch_size"],
-            shuffle=False,
-            collate_fn=collate_fn,
-            num_workers=self.config["n_worker"],
-            prefetch_factor=1,
-            persistent_workers=True,
-            pin_memory=True,
-            drop_last=False,
+            **dataloader_config,
         )
 
         # accelerator处理变量
@@ -269,7 +278,7 @@ class DLExperiment(ABC):
 
         self.valid_step = len(
             self.train_dataloader
-        ) // self.config["n_valid_per_epoch"]
+        ) // self.params["n_valid_per_epoch"]
 
         train_loss_agg = LossAggregator()
 
@@ -277,7 +286,7 @@ class DLExperiment(ABC):
 
         # 训练循环
         for e in tqdm(
-            range(self.config["epoch"]),
+            range(self.params["epoch"]),
             disable=not self.accelerator.is_main_process,
         ):
             # 终止训练
@@ -302,12 +311,13 @@ class DLExperiment(ABC):
                 # 正向
                 output: Dict[str, torch.Tensor] = self.model(data)
                 loss: Dict[str, torch.Tensor] = self.loss_func(data, output)
+                # print(self.step, loss)
                 train_loss_agg.update(loss)
                 
                 self.accelerator.backward(loss["loss"])
-                if self.config["clip_norm"] != float("inf"):
+                if self.params["clip_norm"] != float("inf"):
                     self.accelerator.clip_grad_norm_(
-                        self.model.parameters(), self.config["clip_norm"]
+                        self.model.parameters(), self.params["clip_norm"]
                     )
 
                 # 反向
@@ -342,7 +352,7 @@ class DLExperiment(ABC):
 
         self.callback.run("on_train_end")
 
-    def test(self, ckpt: str | None = None) -> None:
+    def test(self, model: nn.Module, ckpt: str | None = None) -> Dict[str, Any]:
         """
         计算测试集指标
         """
@@ -350,24 +360,28 @@ class DLExperiment(ABC):
         self.accelerator.wait_for_everyone()
 
         if ckpt is None:
-            ckpt = get_newest_ckpt(self.config["folder"])
+            ckpt = get_newest_ckpt(self.folder)
 
         state = torch.load(os.path.join(
-            self.config["folder"], ckpt
+            self.folder, ckpt
         ), map_location="cpu")
-        self.model = self.build_model()
+        self.model = model
         self.model.load_state_dict(state, strict=True)
+
+        dataloader_config: Dict[str, Any] = {
+            "batch_size": self.params["batch_size"],
+            "collate_fn": collate_fn,
+            "num_workers": self.params["n_worker"],
+            "pin_memory": True,
+        }
+        # 对于rdma挂载不预取更稳定
+        if dataloader_config["num_workers"] > 0:
+            dataloader_config["prefetch_factor"] = 1
+            dataloader_config["persistent_workers"] = True
 
         self.test_dataloader = DataLoader(
             self.test_dataset,
-            batch_size=self.config["batch_size"],
-            shuffle=False,
-            collate_fn=collate_fn,
-            num_workers=self.config["n_worker"],
-            prefetch_factor=1,
-            persistent_workers=False,
-            pin_memory=True,
-            drop_last=False,
+            **dataloader_config,
         )
 
         self.model, self.test_dataloader = self.accelerator.prepare(
@@ -379,10 +393,10 @@ class DLExperiment(ABC):
 
         if self.accelerator.is_main_process:
             np.save(os.path.join(
-                self.config["folder"], "y_pred.npy"
+                self.folder, "y_pred.npy"
             ), self.output["y_pred"])
             np.save(os.path.join(
-                self.config["folder"], "y.npy"
+                self.folder, "y.npy"
             ), self.test_dataloader.dataset.y.data)
 
         # 记录指标并打印
@@ -390,6 +404,7 @@ class DLExperiment(ABC):
             self.test_dataloader.dataset, self.output
         )
         self.logger.info(f"test metric: {self.metric}")
+        return self.metric
 
     def predict(
         self,
@@ -449,74 +464,31 @@ class DLExperiment(ABC):
             self.writer.close()
 
 
-class HDF5DLExperiment(DLExperiment):
+class MinuteDLExperiment(DLExperiment):
     """
-    基于HDF5数据库的DL实验
+    针对一分钟频的深度学习实验基类
     """
 
-    config: Dict[str, Any] = {
-        **DLExperiment.config,
-
-        "bin_folder": None,
-        "hdf5_folder": None,
+    def metric_func(
+        self,
+        dataset: Dataset,
+        output: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """
+        返回整体IC, 前30分钟和前90分钟IC
+        """
+        if hasattr(self.get_model(), "metric_func"):
+            return self.get_model().metric_func(dataset, output)
         
-        "x_names": slice(None),
-        "y_names": None,
-        "start_minute": None,
-        "end_minute": None,
-        "stride": 1,
-        "seq_len": None,
-
-        "train_start_dt": None,
-        "train_end_dt": None,
-        "valid_start_dt": None,
-        "valid_end_dt": None,
-        "test_start_dt": None,
-        "test_end_dt": None,
-    }
-
-    def load_data(self, ) -> None:
-        """
-        从HDF5数据库中加载数据
-        """
-
-        hdf5_db = HDF5MinuteDataBase(
-            self.config["hdf5_folder"], self.config["bin_folder"]
+        y_pred: MinuteData = copy.copy(dataset.y)
+        y_pred.data = output["y_pred"].detach().numpy().reshape(
+            dataset.y.shape
         )
-        if self.config["x_names"] == slice(None):
-            self.x_names: List[str] = hdf5_db.names
-        else:
-            self.x_names = self.config["x_names"]
-
-        dataset_cls: Callable = partial(
-            HDF5MinuteDataset,
-            hdf5_db=hdf5_db,
-            x_names=self.config["x_names"],
-            y_names=self.config["y_names"],
-            start_minute=self.config["start_minute"],
-            end_minute=self.config["end_minute"],
-            seq_len=self.config["seq_len"],
-        )
-
-        self.train_dataset = dataset_cls(
-            start_dt=self.config["train_start_dt"],
-            end_dt=self.config["train_end_dt"],
-            stride=self.config["stride"],
-        )
-        self.valid_dataset = dataset_cls(
-            start_dt=self.config["valid_start_dt"],
-            end_dt=self.config["valid_end_dt"],
-            stride=self.config["stride"],
-        )
-
-        # 测试时步长必须为1
-        self.test_dataset = dataset_cls(
-            start_dt=self.config["test_start_dt"],
-            end_dt=self.config["test_end_dt"],
-            stride=1,
-        )
-        # self.logger.info(
-        #     f"{len(self.train_dataset)} train, "
-        #     f"{len(self.valid_dataset)} valid, "
-        #     f"{len(self.test_dataset)} test"
-        # )
+        cross_ics: np.ndarray = cross_ic(dataset.y, y_pred, mean=False)
+        min30_idx_slice: slice = dataset.y.minutes.index_range(None, 30)
+        min90_idx_slice: slice = dataset.y.minutes.index_range(None, 90)
+        return {
+            "cross_ic": np.mean(cross_ics),
+            "cross_ic30": np.mean(cross_ics[:, min30_idx_slice]),
+            "cross_ic90": np.mean(cross_ics[:, min90_idx_slice]),
+        }

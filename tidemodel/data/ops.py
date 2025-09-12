@@ -2,8 +2,6 @@
 基于分钟数据计算指标
 """
 
-from typing import Tuple
-
 import numpy as np
 
 from .data import MinuteData
@@ -23,7 +21,7 @@ def np_ic(x1: np.ndarray, x2: np.ndarray) -> float:
     assert x1.ndim == 1
     assert x2.shape == x1.shape
 
-    mask: np.ndarray = ~(np.isnan(x1) | np.isnan(x2))
+    mask: np.ndarray = np.isfinite(x1) & np.isfinite(x2)
     return np.corrcoef(x1[mask], x2[mask])[0, 1]
 
 
@@ -83,8 +81,8 @@ def np_mr(x1: np.ndarray, x2: np.ndarray) -> float:
     assert x1.ndim == 1
     assert x2.shape == x1.shape
 
-    x1_mask: np.ndarray = ~np.isnan(x1)
-    return (x1_mask & np.isnan(x2)).sum() / x1_mask.sum()
+    x1_mask: np.ndarray = np.isfinite(x1)
+    return (x1_mask & (~np.isfinite(x2))).sum() / x1_mask.sum()
 
 
 def np_cross_norm(x: np.ndarray, axis: int) -> np.ndarray:
@@ -104,6 +102,18 @@ MinuteData相关计算函数
 
 底层均基于numpy计算
 """
+
+def ic(
+    x1: MinuteData,
+    x2: MinuteData,
+) -> float:
+    """
+    计算两个分钟频数据的整体ic
+    """
+    return np_ic(
+        x1=x1.data.reshape(-1),
+        x2=x2.data.reshape(-1),
+    )
 
 
 def long_ic(

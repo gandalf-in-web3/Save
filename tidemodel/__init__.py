@@ -4,6 +4,8 @@ from . import dl
 
 from . import ml
 
+from . import models
+
 from . import rl
 
 from . import utils

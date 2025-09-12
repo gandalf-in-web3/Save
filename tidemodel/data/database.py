@@ -18,7 +18,7 @@ from tqdm.auto import tqdm
 
 from .data import HDF5Ndarray, MinuteData, SortedIndex
 from .ops import cross_ic, long_ic, mr
-from ..utils import validate_float_to_int, write_txt
+from ..utils import read_txt, validate_float_to_int, write_txt
 
 
 """
@@ -83,10 +83,13 @@ class BinMinuteDataBase:
     def list_y_names(self, ) -> List[str]:
         """
         获取所有可用标签名
+
+        有的文件是以.feature结尾的, 也需要去掉
         """
         names: List[str] = os.listdir(os.path.join(self.folder, 'y'))
-        return [name for name in names if name[0] != '.']
-    
+        names = [name for name in names if name[0] != '.']
+        return [name for name in names if name[-8: ] != '.feather']
+
     def read_x(
         self,
         name: str,
@@ -344,12 +347,8 @@ class HDF5MinuteDataBase:
 
     def __init__(self, folder: str, bin_folder: str) -> None:
         self.folder: str = folder
-
         self.bin_db = BinMinuteDataBase(bin_folder)
-
-        with open(os.path.join(self.folder, "names.txt")) as f:
-            self.names = f.readlines()
-            self.names = np.array([name.strip() for name in self.names])
+        self.names: List[str] = read_txt(os.path.join(self.folder, "names.txt"))
 
         self.files: List[str] = [
             file for file in os.listdir(self.folder) if file[-3: ] == ".h5"
@@ -393,7 +392,7 @@ class HDF5MinuteDataBase:
             dates=y.dates.data,
             minutes=y.minutes.data,
             tickers=y.tickers.data,
-            names=self.names,
+            names=np.array(self.names),
         )[:, :, :, x_names]
 
         def read_and_assign(i: int) -> None:
@@ -404,7 +403,7 @@ class HDF5MinuteDataBase:
                     dates=np.array([dates[i], ]),
                     minutes=self.bin_db.minutes,
                     tickers=self.bin_db.tickers,
-                    names=self.names,
+                    names=np.array(self.names),
                     data=f["x"][:],
                 )[:, minute_slice, tickers, x_names].data
 
@@ -470,7 +469,7 @@ class HDF5MinuteDataBase:
                     dates=np.array([dates[i], ]),
                     minutes=self.bin_db.minutes,
                     tickers=self.bin_db.tickers,
-                    names=self.names,
+                    names=np.array(self.names),
                     data=f["x"][:],
                 )[:, minute_slice, tickers, x_names]
                 x = apply_func_x(x)
@@ -499,7 +498,9 @@ class HDF5MinuteDataBase:
         以懒加载模式读取数据集
         """
         # 读取y
-        y: MinuteData = self.bin_db.read_multi_data('y', y_names)
+        y: MinuteData = self.bin_db.read_multi_data(
+            'y', y_names, n_worker=2
+        )
 
         # 懒加载x, 将dataset组合成HDF5Ndarray
         self.handles: List[h5py.File] = [
@@ -512,7 +513,7 @@ class HDF5MinuteDataBase:
             dates=y.dates.data,
             minutes=y.minutes.data,
             tickers=y.tickers.data,
-            names=self.names,
+            names=np.array(self.names),
             data=HDF5Ndarray([handle["x"] for handle in self.handles]),
         )
         return x, y

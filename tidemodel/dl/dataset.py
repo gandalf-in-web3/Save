@@ -3,13 +3,14 @@
 """
 
 import itertools
-from typing import Any, Dict, List, Tuple, Union
+from functools import partial
+from typing import Any, Callable, Dict, List, Tuple, Type, Union
 
 import torch
 import numpy as np
 from torch.utils.data import Dataset
 
-from ..data import HDF5MinuteDataBase, MinuteData, cross_norm
+from ..data import BinMinuteDataBase, HDF5MinuteDataBase, MinuteData, cross_norm
 
 
 def collate_fn(
@@ -58,9 +59,13 @@ def load_to_device(
             data[k] = data[k].to(device, non_blocking=True)
 
 
-class BinMinuteDataset(Dataset):
+"""
+数据集类
+"""
+
+class PreloadMinuteDataset(Dataset):
     """
-    基于二进制数据库构建数据集
+    基于提前加载好的x和y来构建数据集
 
     尽量避免对矩阵有过多的操作, 原因如下:
     1. 矩阵占用内存高, 直接操作内存和耗时都会爆炸
@@ -71,70 +76,59 @@ class BinMinuteDataset(Dataset):
         self,
         whole_x: MinuteData,
         whole_y: MinuteData,
-        start_dt: np.datetime64 | None,
-        end_dt: np.datetime64 | None,
-        start_minute: int | None,
-        end_minute: int | None,
-        stride: int = 1,
+        date_slice: slice = slice(None),
+        minute_slice: slice = slice(None),
         seq_len: int | None = None,
         cross_norm_y: bool = False,
     ) -> None:
+        self.seq_len: int | None = seq_len
+        self.x_names: List[str] = list(whole_x.names.data)
+        self.y_names: List[str] = list(whole_y.names.data)
+
+        self.whole_x: MinuteData = None
+        self.whole_y: MinuteData = None
+        self.y: MinuteData = None
+
         self._load_x_and_y(
             whole_x=whole_x,
             whole_y=whole_y,
-            start_dt=start_dt,
-            end_dt=end_dt,
-            start_minute=start_minute,
-            end_minute=end_minute,
+            date_slice=date_slice,
+            minute_slice=minute_slice,
             cross_norm_y=cross_norm_y,
         )
-
-        self.stride: int = stride
-        self.seq_len: int | None = seq_len
 
     def _load_x_and_y(
         self,
         whole_x: MinuteData,
         whole_y: MinuteData,
-        start_dt: np.datetime64 | None,
-        end_dt: np.datetime64 | None,
-        start_minute: int | None,
-        end_minute: int | None,
+        date_slice: slice = slice(None),
+        minute_slice: slice = slice(None),
         cross_norm_y: bool = False,
     ) -> None:
         """
         根据整个x和y矩阵计算y, y_pred和index
         """
-        self.whole_x: MinuteData = whole_x
-        self.whole_y: MinuteData = whole_y
+        self.whole_x = whole_x
+        self.whole_y = whole_y
+
         if cross_norm_y:
             self.whole_y = cross_norm(self.whole_y)
 
-        self.y: MinuteData = self.whole_y[
-            slice(start_dt, end_dt),
-            slice(start_minute, end_minute, self.stride)
+        self.y = self.whole_y[date_slice, minute_slice]
+
+        date_idx_slice: slice = self.whole_y.dates.index_range(
+            date_slice.start, date_slice.stop, date_slice.step
+        )
+        self.date_indexes = list(range(len(self.whole_y.dates)))[date_idx_slice]
+
+        minute_idx_slice: slice = self.whole_y.minutes.index_range(
+            minute_slice.start, minute_slice.stop, minute_slice.step
+        )
+        self.minute_indexes = list(range(len(self.whole_y.minutes)))[
+            minute_idx_slice
         ]
-        self.y_pred: MinuteData = MinuteData(
-            dates=self.y.dates.data,
-            minutes=self.y.minutes.data,
-            tickers=self.y.tickers.data,
-            names=self.y.names.data,
-        )
-
-        dt_slice: slice = self.whole_y.dates.index_range(
-            start_dt, end_dt
-        )
-        self.dt_indexes = list(range(len(self.whole_y.dates)))[dt_slice]
-
-        minute_slice: slice = self.whole_y.minutes.index_range(
-            start_minute, end_minute, self.stride
-        )
-        self.minute_indexes = list(range(len(
-            self.whole_y.minutes
-        )))[minute_slice]
-
         self.indexes: List[Tuple[int, int]] = list(
-            itertools.product(self.dt_indexes, self.minute_indexes)
+            itertools.product(self.date_indexes, self.minute_indexes)
         )
 
     def __len__(self) -> int:
@@ -179,11 +173,11 @@ class BinMinuteDataset(Dataset):
         }
 
 
-class HDF5MinuteDataset(BinMinuteDataset):
+class LazyMinuteDataset(PreloadMinuteDataset):
     """
     基于HDF5分钟数据库构建数据集
 
-    无需主动调用load, 在第一次访问时会自动load
+    懒加载模式, 无需主动调用load, 在第一次访问时会自动load
     """
 
     def __init__(
@@ -191,31 +185,27 @@ class HDF5MinuteDataset(BinMinuteDataset):
         hdf5_db: HDF5MinuteDataBase,
         y_names: str | List[str],
         x_names: List[str] | slice = slice(None),
-        start_dt: np.datetime64 | None = None,
-        end_dt: np.datetime64 | None = None,
-        start_minute: int | None = None,
-        end_minute: int | None = None,
-        stride: int = 1,
+        date_slice: slice = slice(None),
+        minute_slice: slice = slice(None),
+        tickers: List[str] | slice = slice(None),
         seq_len: int | None = None,
         cross_norm_y: bool = False,
     ) -> None:
         self.hdf5_db = hdf5_db
-        self.x_names: List[str] | slice = x_names
+        self.x_names: List[str] | slice = (
+            self.hdf5_db.names if x_names == slice(None)
+            else x_names
+        )
         self.y_names: str | List[str] = y_names
-        self.start_dt: np.datetime64 | None = start_dt
-        self.end_dt: np.datetime64 | None = end_dt
-        self.start_minute: int | None = start_minute
-        self.end_minute: int | None = end_minute
-        self.stride: int = stride
+        self.date_slice: slice = date_slice
+        self.minute_slice: slice = minute_slice
+        self.tickers: List[str] | slice = tickers
         self.seq_len: int | None = seq_len
         self.cross_norm_y: bool = cross_norm_y
 
-        # 数据, y常用于评估
         self.whole_x: MinuteData = None
         self.whole_y: MinuteData = None
         self.y: MinuteData = None
-        self.dt_indexes: List[int] = None
-        self.minute_indexes: List[int] = None
 
         self._load: bool = False
 
@@ -226,22 +216,17 @@ class HDF5MinuteDataset(BinMinuteDataset):
         whole_x, whole_y = self.hdf5_db.read_dataset_lazy(
             self.y_names
         )
-
         self._load_x_and_y(
             whole_x=whole_x,
             whole_y=whole_y,
-            start_dt=self.start_dt,
-            end_dt=self.end_dt,
-            start_minute=self.start_minute,
-            end_minute=self.end_minute,
+            date_slice=self.date_slice,
+            minute_slice=self.minute_slice,
             cross_norm_y=self.cross_norm_y,
         )
 
-        # 提前计算因子名索引
-        if self.x_names == slice(None):
-            self.name_idx_slice: slice | Tuple[int] = slice(None)
-        else:
-            self.name_idx_slice = whole_x.names.index_list(self.x_names)
+        # 提前计算股票名和因子名索引
+        self.ticker_idx_slice = whole_x.tickers.index_list(self.tickers)
+        self.name_idx_slice = whole_x.names.index_list(self.x_names)
 
         self._load = True
 
@@ -259,7 +244,133 @@ class HDF5MinuteDataset(BinMinuteDataset):
 
         # 根据选择的因子名对数据索引
         if self.seq_len is None:
-            data["x"] = data["x"][:, self.name_idx_slice]
+            data["x"] = data["x"][self.ticker_idx_slice, self.name_idx_slice]
         else:
-            data["x"] = data["x"][:, :, self.name_idx_slice]
+            data["x"] = data["x"][:, self.ticker_idx_slice, self.name_idx_slice]
         return data
+
+
+"""
+一次性创建训练集, 验证集和测试集
+"""
+
+def get_datasets(
+    dataset_cls: Type[Dataset],
+    train_date_slice: slice = slice(None),
+    valid_date_slice: slice = slice(None),
+    test_date_slice: slice = slice(None),
+    minute_slice: slice = slice(None),
+) -> Tuple[Dataset, Dataset, Dataset]:
+    """
+    根据参数获取训练集, 验证集和测试集
+    """
+    train_dataset: Dataset = dataset_cls(
+        date_slice=train_date_slice,
+        minute_slice=minute_slice,
+    )
+    valid_dataset: Dataset = dataset_cls(
+        date_slice=valid_date_slice,
+        minute_slice=minute_slice,
+    )
+
+    # 测试时步长必须为1
+    test_dataset: Dataset = dataset_cls(
+        date_slice=slice(
+            test_date_slice.start,
+            test_date_slice.stop,
+            1,
+        ),
+        minute_slice=slice(
+            minute_slice.start,
+            minute_slice.stop,
+            1,
+        ),
+    )
+    return train_dataset, valid_dataset, test_dataset
+
+
+def get_preload_datasets(
+    bin_folder: str,
+    y_names: str | List[str],
+    hdf5_folder: str | None = None,
+    x_names: List[str] | slice = slice(None),
+    train_date_slice: slice = slice(None),
+    valid_date_slice: slice = slice(None),
+    test_date_slice: slice = slice(None),
+    minute_slice: slice = slice(None),
+    tickers: slice | List[str] = slice(None),
+    seq_len: int | None = None,
+    cross_norm_y: bool = False,
+) -> Tuple[Dataset, Dataset, Dataset]:
+    """
+    获取预加载训练集. 验证集和测试集
+    """
+    if hdf5_folder is None:
+        assert isinstance(x_names, list)
+
+        bin_db = BinMinuteDataBase(bin_folder)
+        whole_x, whole_y = bin_db.read_dataset(
+            x_names=x_names,
+            y_names=y_names,
+            tickers=tickers,
+        )
+    else:
+        hdf5_db = HDF5MinuteDataBase(hdf5_folder, bin_folder)
+        whole_x, whole_y = hdf5_db.read_dataset(
+            x_names=x_names,
+            y_names=y_names,
+            tickers=tickers,
+        )
+
+    dataset_cls: Callable = partial(
+        PreloadMinuteDataset,
+        whole_x=whole_x,
+        whole_y=whole_y,
+        seq_len=seq_len,
+        cross_norm_y=cross_norm_y,
+    )
+    return get_datasets(
+        dataset_cls=dataset_cls,
+        train_date_slice=train_date_slice,
+        valid_date_slice=valid_date_slice,
+        test_date_slice=test_date_slice,
+        minute_slice=minute_slice,
+    )
+
+
+def get_lazy_datasets(
+    bin_folder: str,
+    hdf5_folder: str,
+    y_names: str | List[str],
+    x_names: List[str] | slice = slice(None),
+    train_date_slice: slice = slice(None),
+    valid_date_slice: slice = slice(None),
+    test_date_slice: slice = slice(None),
+    minute_slice: slice = slice(None),
+    tickers: slice | List[str] = slice(None),
+    seq_len: int | None = None,
+    cross_norm_y: bool = False,
+) -> Tuple[Dataset, Dataset, Dataset]:
+    """
+    获取懒加载训练集. 验证集和测试集
+    """
+
+    hdf5_db = HDF5MinuteDataBase(
+        hdf5_folder, bin_folder
+    )
+    dataset_cls: Callable = partial(
+        LazyMinuteDataset,
+        hdf5_db=hdf5_db,
+        x_names=x_names,
+        y_names=y_names,
+        tickers=tickers,
+        seq_len=seq_len,
+        cross_norm_y=cross_norm_y,
+    )
+    return get_datasets(
+        dataset_cls=dataset_cls,
+        train_date_slice=train_date_slice,
+        valid_date_slice=valid_date_slice,
+        test_date_slice=test_date_slice,
+        minute_slice=minute_slice,
+    )

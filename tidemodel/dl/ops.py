@@ -6,15 +6,33 @@ import torch
 import torch.nn.functional as F
 
 
+def mae_loss(
+    y: torch.Tensor,
+    y_pred: torch.Tensor,    
+) -> torch.Tensor:
+    """
+    计算两个二维tensor之间的L1损失函数
+
+    自动忽略nan
+    """
+
+    assert y.shape == y_pred.shape
+
+    mask: torch.Tensor = ~torch.isnan(y)
+    return F.l1_loss(y[mask], y_pred[mask])
+
+
 def mse_loss(
     y: torch.Tensor,
     y_pred: torch.Tensor,    
 ) -> torch.Tensor:
     """
-    计算两个二维tensor之间的mse损失函数
+    计算两个二维tensor之间的L2损失函数
 
     自动忽略nan
     """
+
+    assert y.shape == y_pred.shape
 
     mask: torch.Tensor = ~torch.isnan(y)
     return F.mse_loss(y[mask], y_pred[mask])
@@ -75,3 +93,21 @@ def cross_ic_loss(
     """
 
     return -cross_ic(y, y_pred)
+
+
+def emd_loss(
+    y: torch.Tensor,
+    y_pred: torch.Tensor,
+) -> torch.Tensor:
+    """
+    计算两个二维矩阵之间的EMD loss
+
+    用于衡量两个分布之间的差异, 具有排序不变性
+    """
+
+    assert y.ndim == 2
+    assert y.shape == y_pred.shape
+
+    y, _ = torch.sort(y, dim=1)
+    y_pred, _ = torch.sort(y_pred, dim=1)
+    return mae_loss(y, y_pred)

@@ -33,7 +33,7 @@ class Index(ABC):
         """
         pass
 
-    def index_list(self, values: List[Any]) -> List[int] | slice:
+    def index_list(self, values: List[Any] | slice) -> List[int] | slice:
         """
         获取一组值所在的位置
         
@@ -41,6 +41,13 @@ class Index(ABC):
 
         若所在位置是连续的, 返回slice以避免拷贝
         """
+        if isinstance(values, slice):
+            assert (
+                values.start is None and values.stop is None,
+                f"only support step slice"
+            )
+            return values
+
         assert isinstance(values, list)
         assert len(values) > 0
 
@@ -119,9 +126,6 @@ class MinuteData:
         self.minutes: Index = SortedIndex(minutes)
         self.tickers: Index = UniqueIndex(tickers)
         self.names: Index = UniqueIndex(names)
-        self.shape: Tuple[int] = (
-            len(dates), len(minutes), len(tickers), len(names)
-        )
 
         if data is None:
             self.data: np.ndarray | HDF5Ndarray = np.empty(
@@ -130,6 +134,15 @@ class MinuteData:
         else:
             self.data = data
             assert self.data.shape == self.shape
+
+    @property
+    def shape(self, ) -> Tuple[int, int, int, int]:
+        return (
+            len(self.dates),
+            len(self.minutes),
+            len(self.tickers),
+            len(self.names)
+        )
 
     def __getitem__(self, value_slices: slice | Tuple[slice]) -> "MinuteData":
         """
@@ -158,12 +171,10 @@ class MinuteData:
             value_slices[1].start, value_slices[1].stop, value_slices[1].step,
         )
         ticker_idx_slice: List[int] | slice = (
-            slice(None) if value_slices[2] == slice(None)
-            else self.tickers.index_list(value_slices[2])
+            self.tickers.index_list(value_slices[2])
         )
         name_idx_slice: List[int] | slice = (
-            slice(None) if value_slices[3] == slice(None)
-            else self.names.index_list(value_slices[3])
+            self.names.index_list(value_slices[3])
         )
         return MinuteData(
             dates=self.dates.data[date_idx_slice],
