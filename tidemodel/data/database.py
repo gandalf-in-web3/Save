@@ -78,7 +78,8 @@ class BinMinuteDataBase:
         获取所有可用因子名
         """
         names: List[str] = os.listdir(os.path.join(self.folder, 'x'))
-        return [name for name in names if name[0] != '.']
+        names = [name for name in names if name[0] != '.']
+        return [name for name in names if name[-8: ] != '.feather']
 
     def list_y_names(self, ) -> List[str]:
         """
@@ -229,6 +230,11 @@ class BinMinuteDataBase:
             data.data[:, :, :, i] = read_func(
                 names[i], date_slice.start, date_slice.stop
             )[:: date_slice.step, minute_slice, tickers].data.squeeze(-1)
+
+        if n_worker == 0:
+            for i in range(len(names)):
+                read_and_assign(i)
+            return data
 
         with ThreadPoolExecutor(min(n_worker, len(names))) as executor:
             futures = [
@@ -499,7 +505,7 @@ class HDF5MinuteDataBase:
         """
         # 读取y
         y: MinuteData = self.bin_db.read_multi_data(
-            'y', y_names, n_worker=2
+            'y', y_names, n_worker=0
         )
 
         # 懒加载x, 将dataset组合成HDF5Ndarray
@@ -508,9 +514,9 @@ class HDF5MinuteDataBase:
                 os.path.join(self.folder, file), 'r', locking=False
             ) for file in self.files
         ]
-
+        
         x = MinuteData(
-            dates=y.dates.data,
+            dates=self.dates,
             minutes=y.minutes.data,
             tickers=y.tickers.data,
             names=np.array(self.names),
@@ -526,6 +532,12 @@ class StatsDataBase:
 
     def __init__(self, file: str) -> None:
         self.df: pd.DataFrame =  pd.read_csv(file, index_col=0)
+
+    def list_x_names(self, ) -> List[str]:
+        """
+        返回目前已经计算的指标
+        """
+        return self.df.index.to_list()
 
     def get_stats(self, col: str, x_names: List[str]) -> np.ndarray:
         """
@@ -644,7 +656,6 @@ def _read_and_save_hdf5(
         dataset = f.create_dataset(
             "x",
             data=x.data,
-            chunks=(1, 1) + x.shape[2: ],
         )
 
 
@@ -652,6 +663,7 @@ def build_hdf5_db(
     from_folder: str,
     to_folder: str,
     x_names: List[str],
+    date_slice: slice = slice(None),
     n_worker: int = 32,
 ) -> None:
     """
@@ -667,6 +679,11 @@ def build_hdf5_db(
     write_txt(os.path.join(to_folder, "names.txt"), x_names)
 
     # 按日期读取并保存h5文件
+    date_indx_slice = SortedIndex(from_db.dates).index_range(
+        date_slice.start, date_slice.stop, date_slice.step
+    )
+    dates: np.ndarray = from_db.dates[date_indx_slice]
+
     with ProcessPoolExecutor(n_worker) as executor:
         print("start read and save date.h5")
         futures = [executor.submit(
@@ -675,9 +692,9 @@ def build_hdf5_db(
             to_folder,
             x_names,
             date,
-        ) for date in from_db.dates]
+        ) for date in dates]
         
-        for future in tqdm(as_completed(futures), total=len(from_db.dates)):
+        for future in tqdm(as_completed(futures), total=len(dates)):
             try:
                 future.result()
             except Exception as e:
@@ -699,13 +716,20 @@ def _read_and_compute_norm_stats(
     from_db = BinMinuteDataBase(from_folder)
     x: MinuteData = from_db.read_x(x_name, start_dt, end_dt)
     x = x[:, start_minute: end_minute]
-
-    x_05, x_50, x_995 = np.nanpercentile(x.data, [0.5, 50, 99.5])
-    return {
-        "x_05": x_05,
-        "x_50": x_50,
-        "x_995": x_995,
-    }
+    
+    x_stats: Dict[str, float] = {}
+    (
+        x_stats["x_05"],
+        x_stats["x_1"],
+        x_stats["x_25"],
+        x_stats["x_50"],
+        x_stats["x_75"],
+        x_stats["x_99"],
+        x_stats["x_995"]
+    ) = np.nanpercentile(x.data, [
+        0.5, 1, 25, 50, 75, 99, 99.5
+    ])
+    return x_stats
 
 
 def build_norm_stats_db(
@@ -790,12 +814,14 @@ def build_selection_stats_db(
 ) -> None:
     """
     计算所有x的统计指标并写入到指定文件中
+
+    支持更新模式, 仅重新计算文件中不存在的因子
     """
 
     from_db = BinMinuteDataBase(from_folder)
     x_names = from_db.list_x_names()
 
-    with ProcessPoolExecutor(min(n_worker, len(x_names))) as executor:
+    with ProcessPoolExecutor(min(n_worker, max(len(x_names), 1))) as executor:
         futures = {executor.submit(
             _read_and_compute_selection_stats,
             from_folder,

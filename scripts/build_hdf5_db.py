@@ -4,6 +4,8 @@
 
 import argparse
 
+import numpy as np
+
 import tidemodel as tm
 
 
@@ -12,12 +14,18 @@ if __name__ == "__main__":
     parser.add_argument("--from_folder", type=str, required=True)
     parser.add_argument("--to_folder", type=str, required=True)
     parser.add_argument("--x_names_file", type=str, default=None)
-    parser.add_argument("--n_worker", type=int, default=64)
+    parser.add_argument(
+        "--date_slice",
+        type=lambda x: eval(x, {"np": np}),
+        default=slice(None)
+    )
+    parser.add_argument("--n_worker", type=int, default=32)
     args = parser.parse_args()
 
     tm.data.build_hdf5_db(
         from_folder=args.from_folder,
         to_folder=args.to_folder,
         x_names=tm.utils.read_txt(args.x_names_file),
+        date_slice=args.date_slice,
         n_worker=args.n_worker,
     )

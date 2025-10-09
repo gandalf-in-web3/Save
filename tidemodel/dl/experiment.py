@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Tuple
 import accelerate
 import torch
 import numpy as np
+import torch.onnx as onnx
 from accelerate import Accelerator
 from torch import nn
 from torch.optim import Optimizer
@@ -22,9 +23,14 @@ from tqdm.auto import tqdm
 from .callback import Callback, CallbackManager, EarlyStopSaver
 from .dataset import collate_fn
 from .ops import cross_ic_loss
-from ..data import MinuteData, cross_ic
+from ..data import MinuteData, UniqueIndex, cross_ic
 from ..ml import Experiment
-from ..utils import DummyClass, get_logger, get_newest_ckpt, reset_logger
+from ..utils import (
+    DummyClass,
+    get_logger,
+    get_newest_ckpt,
+    reset_logger,
+)
 
 
 class LossAggregator:
@@ -178,7 +184,7 @@ class DLExperiment(Experiment):
         self.train_dataset: Dataset = train_dataset
         self.valid_dataset: Dataset = valid_dataset
         self.test_dataset: Dataset = test_dataset
-        
+
     def loss_func(
         self,
         data: Dict[str, torch.Tensor],
@@ -192,12 +198,9 @@ class DLExperiment(Experiment):
         默认使用单label cross ic loss
         """
         if hasattr(self.get_model(), "loss_func"):
-            return self.get_model().loss_func(data, output)
+            return self.get_model().loss_func(self, data, output)
 
-        return {"loss": cross_ic_loss(
-            data["y"].squeeze(-1),
-            output["y_pred"].squeeze(-1)
-        )}
+        return {"loss": cross_ic_loss(data["y"], output["y_pred"], dim=-2)}
 
     def metric_func(
         self,
@@ -212,7 +215,7 @@ class DLExperiment(Experiment):
         默认使用整体ic作为评估指标
         """
         if hasattr(self.get_model(), "metric_func"):
-            return self.get_model().metric_func(dataset, output)
+            return self.get_model().metric_func(self, dataset, output)
         
         y_pred: MinuteData = copy.copy(dataset.y)
         y_pred.data = output["y_pred"].detach().numpy().reshape(
@@ -311,13 +314,12 @@ class DLExperiment(Experiment):
                 # 正向
                 output: Dict[str, torch.Tensor] = self.model(data)
                 loss: Dict[str, torch.Tensor] = self.loss_func(data, output)
-                # print(self.step, loss)
                 train_loss_agg.update(loss)
                 
                 self.accelerator.backward(loss["loss"])
                 if self.params["clip_norm"] != float("inf"):
                     self.accelerator.clip_grad_norm_(
-                        self.model.parameters(), self.params["clip_norm"]
+                        self.model.parameters(), self.params["clip_norm"],
                     )
 
                 # 反向
@@ -392,12 +394,14 @@ class DLExperiment(Experiment):
         self.output, _ = self.predict(self.test_dataloader)
 
         if self.accelerator.is_main_process:
+            y: MinuteData = self.test_dataloader.dataset.y
+
             np.save(os.path.join(
                 self.folder, "y_pred.npy"
-            ), self.output["y_pred"])
+            ), self.output["y_pred"].reshape(*y.data.shape)[:, :, :, 0])
             np.save(os.path.join(
                 self.folder, "y.npy"
-            ), self.test_dataloader.dataset.y.data)
+            ), y.data[:, :, :, 0])
 
         # 记录指标并打印
         self.metric: Dict[str, float] = self.metric_func(
@@ -432,13 +436,14 @@ class DLExperiment(Experiment):
                     loss_agg.update(self.loss_func(data, output))
 
                 idx_list.append(data["idx"].reshape(-1))
-                output_list.append(output)
+                # 只聚合y_pred, 防止显存爆炸
+                output_list.append({"y_pred": output["y_pred"]})
 
             idx: torch.Tensor = torch.cat(idx_list, axis=0)
             idx = self.accelerator.gather_for_metrics(idx)
 
             output: Dict[str, torch.Tensor] = {}
-            for k in ["y_pred", ]:
+            for k in output_list[0]:
                 output[k] = torch.cat(
                     [output_list[i][k] for i in range(len(output_list))
                 ], axis=0)
@@ -454,6 +459,46 @@ class DLExperiment(Experiment):
             for k in output:
                 output[k] = output[k].index_select(0, perm[mask]).cpu()
             return output, loss_agg
+
+    def export(self, model: nn.Module, ckpt: str | None = None) -> None:
+        """
+        导出ONNX
+        """
+        if not self.accelerator.is_main_process:
+            return
+
+        torch.cuda.empty_cache()
+
+        if ckpt is None:
+            ckpt = get_newest_ckpt(self.folder)
+
+        state = torch.load(os.path.join(
+            self.folder, ckpt
+        ), map_location="cpu")
+        self.model = model
+        self.model.load_state_dict(state, strict=True)
+
+        class _ExportOnly(nn.Module):
+            def __init__(self, model: nn.Module) -> None:
+                super().__init__()
+                self.model: nn.Module = model
+
+            def forward(self, x) -> torch.Tensor:
+                return self.model({"x": x})["y_pred"]
+
+        model = _ExportOnly(self.get_model())
+        dummy: torch.Tensor = torch.randn(128, 5238, model.model.dim)
+
+        onnx.export(
+            model,
+            dummy,
+            os.path.join(self.folder, "model.onnx"),
+            opset_version=17, 
+            do_constant_folding=True,
+            input_names=["x"],
+            output_names=["y_pred"],
+            dynamic_axes={"x": {0: "datetime", 1: "ticker", 2: "feat"}}
+        )
 
     def close(self, ) -> None:
         """
@@ -477,16 +522,20 @@ class MinuteDLExperiment(DLExperiment):
         """
         返回整体IC, 前30分钟和前90分钟IC
         """
-        if hasattr(self.get_model(), "metric_func"):
-            return self.get_model().metric_func(dataset, output)
-        
-        y_pred: MinuteData = copy.copy(dataset.y)
-        y_pred.data = output["y_pred"].detach().numpy().reshape(
+        first_y: MinuteData = copy.copy(dataset.y)
+        first_y.data = dataset.y.data[:, :, :, 0: 1]
+        first_y.names = UniqueIndex(dataset.y.names.data[0: 1])
+
+        first_y_pred: MinuteData = copy.copy(first_y)
+        first_y_pred.data = output["y_pred"].detach().numpy().reshape(
             dataset.y.shape
+        )[:, :, :, 0: 1]
+
+        cross_ics: np.ndarray = cross_ic(
+            first_y, first_y_pred, mean=False
         )
-        cross_ics: np.ndarray = cross_ic(dataset.y, y_pred, mean=False)
-        min30_idx_slice: slice = dataset.y.minutes.index_range(None, 30)
-        min90_idx_slice: slice = dataset.y.minutes.index_range(None, 90)
+        min30_idx_slice: slice = first_y.minutes.index_range(None, 30)
+        min90_idx_slice: slice = first_y.minutes.index_range(None, 90)
         return {
             "cross_ic": np.mean(cross_ics),
             "cross_ic30": np.mean(cross_ics[:, min30_idx_slice]),

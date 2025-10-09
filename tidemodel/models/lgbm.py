@@ -4,7 +4,6 @@ LightGBM模型
 
 import copy
 import os
-import shutil
 from typing import Any, Dict, List, Tuple
 
 import lightgbm as lgb
@@ -12,7 +11,7 @@ import numpy as np
 import pandas as pd
 
 from ..ml.experiment import Experiment
-from ..data import BinMinuteDataBase, MinuteData, cross_ic
+from ..data import BinMinuteDataBase, MinuteData, cross_ic, cross_norm
 
 
 class LGBMExperiment(Experiment):
@@ -29,12 +28,11 @@ class LGBMExperiment(Experiment):
         "metric": "None",
 
         "boosting": "gbdt",
-        "num_iterations": 1000,
+        "num_iterations": 1500,
         "learning_rate": 0.05,
 
         "max_bin": 31,
         "min_data_in_bin": 1000,
-        # "force_col_wise": True,
 
         "max_depth": 12,
         "num_leaves": 511,
@@ -87,6 +85,7 @@ class LGBMExperiment(Experiment):
         test_date_slice: slice = slice(None),
         minute_slice: slice = slice(None),
         tickers: slice | List[str] = slice(None),
+        cross_norm_y: bool = True,
     ) -> None:
         """
         基于二进制数据库加载数据集
@@ -105,6 +104,9 @@ class LGBMExperiment(Experiment):
             date_slice=train_date_slice,
             minute_slice=minute_slice,
             tickers=tickers,
+            apply_func_y=(
+                lambda x: cross_norm(x) if cross_norm_y else lambda x: x
+            ),
         )
         self.train_dataset = lgb.Dataset(
             train_x,
@@ -120,6 +122,9 @@ class LGBMExperiment(Experiment):
             minute_slice=minute_slice,
             tickers=tickers,
         )
+        if cross_norm_y:
+            self.valid_y = cross_norm(self.valid_y)
+
         self.valid_dataset = lgb.Dataset(
             valid_x.data.reshape(-1, len(self.x_names)),
             label=self.valid_y.data.reshape(-1),
@@ -127,13 +132,20 @@ class LGBMExperiment(Experiment):
         )
 
         # 测试集无需去除nan用于计算截面IC
-        test_x, self.test_y = bin_db.read_dataset(
-            x_names=self.x_names,
-            y_names=self.y_name,
-            date_slice=test_date_slice,
-            minute_slice=minute_slice,
-            tickers=tickers,
-        )
+        if test_date_slice == valid_date_slice:
+            test_x = valid_x
+            self.test_y = self.valid_y
+        else:
+            test_x, self.test_y = bin_db.read_dataset(
+                x_names=self.x_names,
+                y_names=self.y_name,
+                date_slice=test_date_slice,
+                minute_slice=minute_slice,
+                tickers=tickers,
+            )
+            if cross_norm_y:
+                self.test_y = cross_norm(self.test_y)
+
         self.flatten_test_x = test_x.data.reshape(-1, len(self.x_names))
 
         self.logger.info(
@@ -199,8 +211,13 @@ class LGBMExperiment(Experiment):
         gain_importance = self.model.feature_importance(importance_type="gain")
 
         # 计算shap得分
+        # 采样100万样本用于计算
+        rng = np.random.default_rng(42)
+        n: int = len(self.flatten_test_x)
+        idx: np.ndarray = rng.choice(n, min(1000000, n), replace=False)
+
         contrib = self.model.predict(
-            self.flatten_test_x,
+            self.flatten_test_x[idx],
             num_iteration=self.model.best_iteration,
             pred_contrib=True
         )
@@ -214,3 +231,25 @@ class LGBMExperiment(Experiment):
             os.path.join(self.folder, "importance_df.csv")
         )
         return importance_df
+
+    def compute_bins(self, ) -> Dict[str, List[float]]:
+        """
+        根据训练结果计算树的分裂分箱
+        """
+        df: pd.DataFrame = self.model.trees_to_dataframe()
+        df = df[df["split_gain"].notnull()]
+        df["threshold_value"] = pd.to_numeric(df["threshold"], errors="coerce")
+        df = df.dropna(subset=["threshold_value"])
+
+        x_names = list(self.model.feature_name())
+        bins: Dict[str, List[float]] = {name: [] for name in x_names}
+
+        for feat, g in df.groupby("split_feature"):
+            if feat in bins:
+                vals = np.unique(
+                    g["threshold_value"].to_numpy(dtype=np.float32)
+                )
+                bins[feat] = vals.tolist()
+        
+        np.save(os.path.join(self.folder, "bins.npy"), bins, allow_pickle=True)
+        return bins

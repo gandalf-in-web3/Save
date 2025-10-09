@@ -4,4 +4,4 @@ from .lgbm import *
 
 from .mlp import *
 
-from .rnn import *
+from .gru import *

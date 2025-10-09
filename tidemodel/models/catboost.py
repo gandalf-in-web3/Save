@@ -11,7 +11,7 @@ import pandas as pd
 from catboost import CatBoostRegressor, Pool
 
 from ..ml.experiment import Experiment
-from ..data import BinMinuteDataBase, MinuteData, cross_ic
+from ..data import BinMinuteDataBase, MinuteData, cross_ic, cross_norm
 
 
 class CatboostExperiment(Experiment):
@@ -27,7 +27,7 @@ class CatboostExperiment(Experiment):
         "loss_function": "RMSE",
         "eval_metric": "RMSE",
 
-        "iterations": 1000,
+        "iterations": 1500,
         "learning_rate": 0.05,
 
         "border_count": 31,
@@ -77,6 +77,7 @@ class CatboostExperiment(Experiment):
         test_date_slice: slice = slice(None),
         minute_slice: slice = slice(None),
         tickers: slice | List[str] = slice(None),
+        cross_norm_y: bool = True,
     ) -> None:
         """
         基于二进制数据库加载数据集
@@ -96,6 +97,9 @@ class CatboostExperiment(Experiment):
             date_slice=train_date_slice,
             minute_slice=minute_slice,
             tickers=tickers,
+            apply_func_y=(
+                lambda x: cross_norm(x) if cross_norm_y else lambda x: x
+            ),
         )
         self.train_dataset = Pool(
             flatten_train_x,
@@ -109,6 +113,9 @@ class CatboostExperiment(Experiment):
             date_slice=valid_date_slice,
             minute_slice=minute_slice,
             tickers=tickers,
+            apply_func_y=(
+                lambda x: cross_norm(x) if cross_norm_y else lambda x: x
+            ),
         )
         self.valid_dataset = Pool(
             flatten_valid_x,
@@ -123,15 +130,18 @@ class CatboostExperiment(Experiment):
             minute_slice=minute_slice,
             tickers=tickers,
         )
-        flatten_test_x, flatten_test_y = bin_db.read_flatten_dataset(
+        self.flatten_test_x, flatten_test_y = bin_db.read_flatten_dataset(
             x_names=self.x_names,
             y_name=self.y_name,
             date_slice=test_date_slice,
             minute_slice=minute_slice,
             tickers=tickers,
+            apply_func_y=(
+                lambda x: cross_norm(x) if cross_norm_y else lambda x: x
+            ),
         )
         self.test_dataset = Pool(
-            flatten_test_x,
+            self.flatten_test_x,
             label=flatten_test_y,
             feature_names=self.x_names,
         )
@@ -180,16 +190,22 @@ class CatboostExperiment(Experiment):
         """
         根据训练结果计算重要度得分
         """
-        feature_names = self.model.feature_names_
+        feature_names: List[str] = self.model.feature_names_
 
-        # 计算置换重要度得分
-        perm_importance = self.model.get_feature_importance(
-            self.test_dataset,
-            type="LossFunctionChange"
+        # 计算shap得分
+        # 采样100万样本用于计算
+        rng = np.random.default_rng(42)
+        n: int = len(self.flatten_test_x)
+        idx: np.ndarray = rng.choice(n, min(1000000, n), replace=False)
+
+        shap_importance = self.model.get_feature_importance(
+            Pool(self.flatten_test_x[idx], feature_names=feature_names),
+            type="ShapValues",
         )
+        shap_importance = np.abs(shap_importance[:, : -1]).mean(axis=0)
 
         importance_df = pd.DataFrame({
-            "perm": perm_importance,
+            "shap": shap_importance,
         }, index=feature_names)
         importance_df.to_csv(
             os.path.join(self.folder, "importance_df.csv")

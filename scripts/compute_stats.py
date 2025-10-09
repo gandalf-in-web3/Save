@@ -19,7 +19,7 @@ if __name__ == "__main__":
     parser.add_argument("--end_dt", type=str, default=None)
     parser.add_argument("--start_minute", type=int, default=None)
     parser.add_argument("--end_minute", type=int, default=None)
-    parser.add_argument("--n_worker", type=int, default=32)
+    parser.add_argument("--n_worker", type=int, default=128)
     args = parser.parse_args()
 
     if args.type == "norm":

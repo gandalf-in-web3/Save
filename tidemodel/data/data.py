@@ -133,7 +133,9 @@ class MinuteData:
             )
         else:
             self.data = data
-            assert self.data.shape == self.shape
+            assert self.data.shape == self.shape, (
+                f"{self.data.shape, self.shape}"
+            )
 
     @property
     def shape(self, ) -> Tuple[int, int, int, int]:

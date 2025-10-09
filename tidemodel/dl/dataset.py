@@ -216,6 +216,12 @@ class LazyMinuteDataset(PreloadMinuteDataset):
         whole_x, whole_y = self.hdf5_db.read_dataset_lazy(
             self.y_names
         )
+        # hdf5数据库中的x可能存在与bin数据库中的y时间不匹配的问题
+        whole_y = whole_y[slice(
+            whole_x.dates.data[0],
+            whole_x.dates.data[-1] + np.timedelta64(1, 'D'),
+        )]
+
         self._load_x_and_y(
             whole_x=whole_x,
             whole_y=whole_y,

@@ -2,6 +2,7 @@
 基于分钟数据计算指标
 """
 
+import cupy as cp
 import numpy as np
 
 from .data import MinuteData
@@ -95,6 +96,38 @@ def np_cross_norm(x: np.ndarray, axis: int) -> np.ndarray:
     mean: np.ndarray = np.nanmean(x, axis=axis, keepdims=True)
     std: np.ndarray = np.nanstd(x, axis=axis, keepdims=True)
     return (x - mean) / std
+
+
+# def mutual_ic(x: np.ndarray, min_n: int = 1000) -> np.ndarray:
+#     """
+#     计算形状为(n, d)的n个样本的相关系数矩阵
+
+#     当共同样本数小于1000时ic记为nan
+#     """
+
+#     assert x.ndim == 2
+
+#     X: cp.ndarray = cp.asarray(x, dtype=cp.float32)
+#     M: cp.ndarray = (~cp.isnan(X)).astype(cp.float32)
+#     X0: cp.ndarray = cp.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+#     N: cp.ndarray = M.T @ M
+#     S: cp.ndarray = X0.T @ M
+#     P: cp.ndarray = X0.T @ X0
+#     S2: cp.ndarray = (X0 ** 2).T @ M
+
+#     N_safe = cp.maximum(N, 1.0)
+#     mu_i: cp.ndarray = S / N_safe
+#     mu_j: cp.ndarray = mu_i.T
+
+#     cov: cp.ndarray = P / N_safe - mu_i * mu_j
+#     var_i: cp.ndarray = S2 / N_safe - mu_i ** 2
+#     var_j: cp.ndarray = var_i.T
+
+#     denom = cp.sqrt(cp.maximum(var_i, 1e-8) * cp.maximum(var_j, 1e-8))
+#     r = (cov / denom).astype(cp.float32)
+#     r = cp.where(N >= min_n, r, cp.nan)
+#     return cp.asnumpy(r)
 
 
 """

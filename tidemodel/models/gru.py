@@ -9,46 +9,47 @@ import numpy as np
 from torch import nn
 
 from ..data import StatsDataBase
+from ..dl import cross_rank
 
 
-class RNN(nn.Module):
+class GRU(nn.Module):
 
     def __init__(
         self,
         dim: int,
+        output_dim: int,
         x_min: np.ndarray,
         x_median: np.ndarray,
         x_max: np.ndarray,
-        mode: Literal["rnn", "gru", "lstm"] = "gru",
         num_layers: int = 1,
+        with_rank: bool = True,
     ) -> None:
-        super(RNN, self).__init__()
+        super().__init__()
+
+        self.with_rank: bool = with_rank
+        if self.with_rank:
+            dim = dim * 2
 
         self.register_buffer("x_min", torch.tensor(x_min))
         self.register_buffer("x_median", torch.tensor(x_median))
         self.register_buffer("x_max", torch.tensor(x_max))
 
-        if mode == "rnn":
-            rnn_cls = nn.RNN
-        elif mode == "gru":
-            rnn_cls = nn.GRU
-        elif mode == "lstm":
-            rnn_cls = nn.LSTM
-        else:
-            raise ValueError(f"{mode} is not supported")
-
-        self.rnn = rnn_cls(
+        self.gru = nn.GRU(
             input_size=dim, 
-            hidden_size=512, 
+            hidden_size=512,
             num_layers=num_layers,
-            dropout=0.5,
             batch_first=True,
         )
-        self.gru_linear = nn.Sequential(
+        self.gru_linear2 = nn.Sequential(
             nn.Linear(512, 512),
         )
 
         self.linear1 = nn.Sequential(
+            # nn.Linear(dim, 2048),
+            # nn.BatchNorm1d(2048),
+            # nn.LeakyReLU(),
+            # nn.Dropout(0.8),
+
             nn.Linear(dim, 1024),
             nn.BatchNorm1d(1024),
             nn.LeakyReLU(),
@@ -58,6 +59,7 @@ class RNN(nn.Module):
         )
 
         self.linear2 = nn.Sequential(
+            nn.Linear(1024, 512),
             nn.BatchNorm1d(512),
             nn.LeakyReLU(),
             nn.Dropout(0.5),
@@ -72,7 +74,7 @@ class RNN(nn.Module):
             nn.LeakyReLU(),
             nn.Dropout(0.1),
 
-            nn.Linear(128, 1),
+            nn.Linear(128, output_dim),
         )
 
         self._init_weight()
@@ -144,14 +146,16 @@ class RNN(nn.Module):
         # 如果min和max中包含nan的话，那么会出现新的nan
         x[torch.isnan(x)] = 0.0
 
+        if self.with_rank:
+            x = torch.cat([x, cross_rank(data["x"], dim=2)], dim=-1)
+
         # 推理得到输出
         b, t, n, d = x.shape
-
-        x_rnn, _ = self.rnn(x.transpose(1, 2).reshape(b * n, t, -1))
-        x_rnn = self.gru_linear(x_rnn[:, -1, :]).reshape(b, n, -1)
+        x_rnn, _ = self.gru(x.transpose(1, 2).reshape(b * n, t, -1))
+        x_rnn = self.gru_linear2(x_rnn[:, -1, :]).reshape(b, n, -1)
 
         x = self.linear1(x.reshape(-1, d)).reshape(b, t, n, -1)
-        x = x[:, -1, :, :] + x_rnn
+        x = torch.concat([x[:, -1, :, :], x_rnn], dim=-1)
 
         y_pred = self.linear2(x.reshape(b * n, -1)).reshape(b, n, -1)
 
@@ -164,21 +168,23 @@ class RNN(nn.Module):
 
 def get_rnn_model(
     x_names: List[str],
+    y_names: List[str],
     x_norm_stats_file: str,
-    model_cls: nn.Module = RNN,
-    mode: Literal["rnn", "gru", "lstm"] = "gru",
+    model_cls: nn.Module = GRU,
     num_layers: int = 1,
+    with_rank: bool = False,
 ) -> nn.Module:
     stats_db = StatsDataBase(x_norm_stats_file)
-    x_min: np.ndarray = stats_db.get_stats("x_05", x_names)
+    x_min: np.ndarray = stats_db.get_stats("x_1", x_names)
     x_median: np.ndarray = stats_db.get_stats("x_50", x_names)
-    x_max: np.ndarray = stats_db.get_stats("x_995", x_names)
+    x_max: np.ndarray = stats_db.get_stats("x_99", x_names)
 
     return model_cls(
         dim=len(x_min),
+        output_dim=len(y_names),
         x_min=x_min,
         x_median=x_median,
         x_max=x_max,
-        mode=mode,
         num_layers=num_layers,
+        with_rank=with_rank,
     )
