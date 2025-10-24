@@ -184,6 +184,11 @@ class DLExperiment(Experiment):
         self.train_dataset: Dataset = train_dataset
         self.valid_dataset: Dataset = valid_dataset
         self.test_dataset: Dataset = test_dataset
+        self.logger.info(
+            f"{len(self.train_dataset)} train, "
+            f"{len(self.valid_dataset)} valid, "
+            # f"{len(self.test_dataset)} test"
+        )
 
     def loss_func(
         self,
@@ -476,6 +481,7 @@ class DLExperiment(Experiment):
             self.folder, ckpt
         ), map_location="cpu")
         self.model = model
+        self.model.to("cpu")
         self.model.load_state_dict(state, strict=True)
 
         class _ExportOnly(nn.Module):
@@ -487,7 +493,7 @@ class DLExperiment(Experiment):
                 return self.model({"x": x})["y_pred"]
 
         model = _ExportOnly(self.get_model())
-        dummy: torch.Tensor = torch.randn(128, 5238, model.model.dim)
+        dummy: torch.Tensor = torch.randn(128, 5238, model.model.raw_dim)
 
         onnx.export(
             model,

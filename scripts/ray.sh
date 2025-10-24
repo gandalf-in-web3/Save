@@ -4,5 +4,4 @@ export CUDA_VISIBLE_DEVICES=1
 
 ray start --address='192.168.4.23:6379' --num-gpus=1 --resources='{"slot": 1}'
 
-
 ray stop

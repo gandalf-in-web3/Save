@@ -8,7 +8,7 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     as_completed,
 )
-from functools import partial
+from functools import partial, lru_cache
 from typing import Callable, Dict, List, Literal, Tuple
 
 import h5py
@@ -719,15 +719,11 @@ def _read_and_compute_norm_stats(
     
     x_stats: Dict[str, float] = {}
     (
-        x_stats["x_05"],
         x_stats["x_1"],
-        x_stats["x_25"],
         x_stats["x_50"],
-        x_stats["x_75"],
         x_stats["x_99"],
-        x_stats["x_995"]
     ) = np.nanpercentile(x.data, [
-        0.5, 1, 25, 50, 75, 99, 99.5
+        1, 50, 99
     ])
     return x_stats
 
@@ -735,6 +731,7 @@ def _read_and_compute_norm_stats(
 def build_norm_stats_db(
     from_folder: str,
     to_file: str,
+    x_names: List[str] | None,
     start_dt: np.datetime64,
     end_dt: np.datetime64,
     start_minute: int | None,
@@ -746,7 +743,8 @@ def build_norm_stats_db(
     """
 
     from_db = BinMinuteDataBase(from_folder)
-    x_names: List[str] = from_db.list_x_names()
+    if x_names is None:
+        x_names = from_db.list_x_names()
 
     with ProcessPoolExecutor(min(n_worker, len(x_names))) as executor:
         futures = {executor.submit(
@@ -765,7 +763,7 @@ def build_norm_stats_db(
             try:
                 x_stats[futures[future]] = future.result()
             except Exception as e:
-                print(f"Error {e}")
+                print(f"Error {x_names[futures[future]]} {e}")
     
     stats_df = pd.DataFrame(x_stats, index=x_names, dtype=np.float32)
     stats_df.to_csv(to_file)

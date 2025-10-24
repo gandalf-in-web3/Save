@@ -1,3 +1,7 @@
+from setproctitle import setproctitle
+
+setproctitle("TideModel")
+
 from . import data
 
 from . import dl

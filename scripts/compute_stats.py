@@ -14,6 +14,7 @@ if __name__ == "__main__":
     parser.add_argument("--type", type=str, required=True)
     parser.add_argument("--from_folder", type=str, required=True)
     parser.add_argument("--to_file", type=str, required=True)
+    parser.add_argument("--x_names_file", type=str, default=None)
     parser.add_argument("--y_name", type=str, default=None)
     parser.add_argument("--start_dt", type=str, default=None)
     parser.add_argument("--end_dt", type=str, default=None)
@@ -26,6 +27,9 @@ if __name__ == "__main__":
         tm.data.build_norm_stats_db(
             from_folder=args.from_folder,
             to_file=args.to_file,
+            x_names=None if args.x_names_file is None else tm.utils.read_txt(
+                args.x_names_file
+            ),
             start_dt=(
                 None if args.start_dt is None
                 else np.datetime64(args.start_dt)

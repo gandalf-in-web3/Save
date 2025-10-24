@@ -98,38 +98,6 @@ def np_cross_norm(x: np.ndarray, axis: int) -> np.ndarray:
     return (x - mean) / std
 
 
-# def mutual_ic(x: np.ndarray, min_n: int = 1000) -> np.ndarray:
-#     """
-#     计算形状为(n, d)的n个样本的相关系数矩阵
-
-#     当共同样本数小于1000时ic记为nan
-#     """
-
-#     assert x.ndim == 2
-
-#     X: cp.ndarray = cp.asarray(x, dtype=cp.float32)
-#     M: cp.ndarray = (~cp.isnan(X)).astype(cp.float32)
-#     X0: cp.ndarray = cp.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-
-#     N: cp.ndarray = M.T @ M
-#     S: cp.ndarray = X0.T @ M
-#     P: cp.ndarray = X0.T @ X0
-#     S2: cp.ndarray = (X0 ** 2).T @ M
-
-#     N_safe = cp.maximum(N, 1.0)
-#     mu_i: cp.ndarray = S / N_safe
-#     mu_j: cp.ndarray = mu_i.T
-
-#     cov: cp.ndarray = P / N_safe - mu_i * mu_j
-#     var_i: cp.ndarray = S2 / N_safe - mu_i ** 2
-#     var_j: cp.ndarray = var_i.T
-
-#     denom = cp.sqrt(cp.maximum(var_i, 1e-8) * cp.maximum(var_j, 1e-8))
-#     r = (cov / denom).astype(cp.float32)
-#     r = cp.where(N >= min_n, r, cp.nan)
-#     return cp.asnumpy(r)
-
-
 """
 MinuteData相关计算函数
 
@@ -202,4 +170,18 @@ def cross_norm(x: MinuteData) -> MinuteData:
     """
     
     x.data = np_cross_norm(x.data, axis=2)
+    return x
+
+
+def t_cross_norm(x: MinuteData) -> MinuteData:
+    """
+    对分钟频数据做截面归一化
+
+    自动忽略nan
+    """
+    
+    t, m, n, d = x.data.shape
+    x.data = np_cross_norm(
+        x.data.reshape(t * m, n, d), axis=0
+    ).reshape(t, m, n, d)
     return x

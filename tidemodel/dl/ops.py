@@ -195,3 +195,27 @@ def apply_split(
     )
     x_split: torch.Tensor = idx.float() / length
     return torch.where(mask, x_split, torch.zeros_like(x_split))
+
+
+def nanmedian(
+    x: torch.Tensor,
+    dim: int = -1,
+    keepdim: bool = False,
+) -> torch.Tensor:
+    nan = torch.isnan(x)
+    filled = torch.where(nan, torch.full_like(x, float('inf')), x)
+    sorted_vals, sorted_idx = torch.sort(filled, dim=dim)
+
+    valid = (~nan).sum(dim=dim, keepdim=True)
+    kth = ((valid - 1) // 2).clamp_min(0).to(torch.long)
+
+    vals = torch.gather(sorted_vals, dim, kth)
+    idxs = torch.gather(sorted_idx, dim, kth)
+
+    vals = torch.where(valid > 0, vals, torch.full_like(vals, float('nan')))
+    idxs = torch.where(valid > 0, idxs, torch.zeros_like(idxs))
+
+    if not keepdim:
+        vals = vals.squeeze(dim)
+        idxs = idxs.squeeze(dim)
+    return vals, idxs

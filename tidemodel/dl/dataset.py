@@ -2,6 +2,7 @@
 数据集
 """
 
+import copy
 import itertools
 from functools import partial
 from typing import Any, Callable, Dict, List, Tuple, Type, Union
@@ -10,7 +11,13 @@ import torch
 import numpy as np
 from torch.utils.data import Dataset
 
-from ..data import BinMinuteDataBase, HDF5MinuteDataBase, MinuteData, cross_norm
+from ..data import (
+    BinMinuteDataBase,
+    HDF5MinuteDataBase,
+    MinuteData,
+    cross_norm, 
+    t_cross_norm,
+)
 
 
 def collate_fn(
@@ -116,6 +123,11 @@ class PreloadMinuteDataset(Dataset):
 
         self.y = self.whole_y[date_slice, minute_slice]
 
+        # self.t_whole_y = copy.deepcopy(self.whole_y)
+        # self.t_whole_y[date_slice, minute_slice].data = t_cross_norm(
+        #     self.t_whole_y[date_slice, minute_slice]
+        # ).data
+
         date_idx_slice: slice = self.whole_y.dates.index_range(
             date_slice.start, date_slice.stop, date_slice.step
         )
@@ -144,6 +156,7 @@ class PreloadMinuteDataset(Dataset):
                 "x": self.whole_x.data[idx0, idx1],
                 "y": self.whole_y.data[idx0, idx1],
                 "idx": np.array([idx, ], np.int64),
+                # "y_t": self.t_whole_y.data[idx0, idx1],
             }
 
         # 时序数据返回数据是(t, n, ...)

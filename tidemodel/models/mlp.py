@@ -9,7 +9,7 @@ import numpy as np
 from torch import nn
 
 from ..data import StatsDataBase
-from ..dl import cross_rank, apply_split
+from ..dl import cross_rank, apply_split, nanmedian
 
 
 class MLP(nn.Module):
@@ -35,7 +35,7 @@ class MLP(nn.Module):
         self.register_buffer("x_max", torch.tensor(x_max))
 
         self.dim: int = dim
-        raw_dim: int = dim
+        self.raw_dim: int = dim
         self.x_names: List[str] | None = x_names
 
         # rank预处理
@@ -44,7 +44,7 @@ class MLP(nn.Module):
         if self.with_rank:
             if self.rank_x_names is None:
                 self.rank_x_slice: slice | list = slice(None)
-                self.dim += raw_dim
+                self.dim += self.raw_dim
             else:
                 self.rank_x_slice = [
                     self.x_names.index(name) for name in self.rank_x_names
@@ -57,7 +57,7 @@ class MLP(nn.Module):
         if self.with_lgb:
             if self.lgb_x_names is None:
                 self.lgb_x_slice: slice | list = slice(None)
-                self.dim += raw_dim
+                self.dim += self.raw_dim
             else:
                 self.lgb_x_slice = [
                     self.x_names.index(name) for name in self.lgb_x_names
@@ -143,7 +143,8 @@ class MLP(nn.Module):
         x: torch.Tensor = data["x"]
         x = torch.where(
             torch.isnan(x),
-            self.x_median.reshape(1, 1, -1),
+            # self.x_median.reshape(1, 1, -1),
+            nanmedian(x, dim=1, keepdim=True)[0],
             x,
         )
         x = (x - self.x_min) / (self.x_max - self.x_min)

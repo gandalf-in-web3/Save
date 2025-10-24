@@ -26,16 +26,18 @@ class GRU(nn.Module):
     ) -> None:
         super().__init__()
 
+        self.dim: int = dim
+        self.raw_dim: int = dim
         self.with_rank: bool = with_rank
         if self.with_rank:
-            dim = dim * 2
+            self.dim += self.raw_dim
 
         self.register_buffer("x_min", torch.tensor(x_min))
         self.register_buffer("x_median", torch.tensor(x_median))
         self.register_buffer("x_max", torch.tensor(x_max))
 
         self.gru = nn.GRU(
-            input_size=dim, 
+            input_size=self.dim, 
             hidden_size=512,
             num_layers=num_layers,
             batch_first=True,
@@ -45,12 +47,7 @@ class GRU(nn.Module):
         )
 
         self.linear1 = nn.Sequential(
-            # nn.Linear(dim, 2048),
-            # nn.BatchNorm1d(2048),
-            # nn.LeakyReLU(),
-            # nn.Dropout(0.8),
-
-            nn.Linear(dim, 1024),
+            nn.Linear(self.dim, 1024),
             nn.BatchNorm1d(1024),
             nn.LeakyReLU(),
             nn.Dropout(0.7),
@@ -154,9 +151,8 @@ class GRU(nn.Module):
         x_rnn, _ = self.gru(x.transpose(1, 2).reshape(b * n, t, -1))
         x_rnn = self.gru_linear2(x_rnn[:, -1, :]).reshape(b, n, -1)
 
-        x = self.linear1(x.reshape(-1, d)).reshape(b, t, n, -1)
-        x = torch.concat([x[:, -1, :, :], x_rnn], dim=-1)
-
+        x = self.linear1(x[:, -1].reshape(-1, d)).reshape(b, n, -1)
+        x = torch.concat([x, x_rnn], dim=-1)
         y_pred = self.linear2(x.reshape(b * n, -1)).reshape(b, n, -1)
 
         # 对输出标准化
