@@ -14,6 +14,7 @@ import torch
 import numpy as np
 import torch.onnx as onnx
 from accelerate import Accelerator
+from accelerate.utils import broadcast_object_list
 from torch import nn
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader, Dataset
@@ -187,7 +188,7 @@ class DLExperiment(Experiment):
         self.logger.info(
             f"{len(self.train_dataset)} train, "
             f"{len(self.valid_dataset)} valid, "
-            # f"{len(self.test_dataset)} test"
+            f"{len(self.test_dataset)} test"
         )
 
     def loss_func(
@@ -342,14 +343,19 @@ class DLExperiment(Experiment):
                     self.output, valid_loss_agg = self.predict(
                         self.valid_dataloader
                     )
-                    self.metric = self.metric_func(
-                        self.valid_dataloader.dataset, self.output
-                    )
+                    if self.accelerator.is_main_process:
+                        self.metric = self.metric_func(
+                            self.valid_dataloader.dataset, self.output
+                        )
+
+                    # 将metric广播到各个节点
+                    payload = [self.metric] if self.accelerator.is_main_process else [None]
+                    broadcast_object_list(payload, from_process=0)
+                    self.metric = payload[0]
 
                     # 记录
                     self._record(train_loss_agg.loss, prefix="train")
                     train_loss_agg.reset()
-
                     self._record(valid_loss_agg.loss, prefix="valid")
                     self._record(self.metric, prefix="valid")
 
@@ -398,15 +404,16 @@ class DLExperiment(Experiment):
         # 计算输出并保存
         self.output, _ = self.predict(self.test_dataloader)
 
-        if self.accelerator.is_main_process:
-            y: MinuteData = self.test_dataloader.dataset.y
+        if not self.accelerator.is_main_process:
+            return {}
 
-            np.save(os.path.join(
-                self.folder, "y_pred.npy"
-            ), self.output["y_pred"].reshape(*y.data.shape)[:, :, :, 0])
-            np.save(os.path.join(
-                self.folder, "y.npy"
-            ), y.data[:, :, :, 0])
+        y: MinuteData = self.test_dataloader.dataset.y
+        np.save(os.path.join(
+            self.folder, "y_pred.npy"
+        ), self.output["y_pred"].reshape(*y.data.shape)[:, :, :, 0])
+        np.save(os.path.join(
+            self.folder, "y.npy"
+        ), y.data[:, :, :, 0])
 
         # 记录指标并打印
         self.metric: Dict[str, float] = self.metric_func(
@@ -418,19 +425,21 @@ class DLExperiment(Experiment):
     def predict(
         self,
         dataloader: DataLoader,
-    ) -> Tuple[torch.Tensor, LossAggregator]:
+    ) -> Tuple[Dict[str, torch.Tensor], LossAggregator]:
         """
         对指定dataloader推理得到输出和聚合loss
 
         如果数据中不包含y则聚合loss为None
+
+        只聚合y_pred, 防止显存爆炸
         """
         self.model.eval()
 
         loss_agg = LossAggregator()
         idx_list: List[torch.Tensor] = []
-        output_list: List[Dict[str, torch.Tensor]] = []
+        y_pred_list: List[torch.Tensor] = []
 
-        with torch.no_grad():
+        with torch.inference_mode():
             for data in tqdm(
                 dataloader,
                 disable=not self.accelerator.is_main_process,
@@ -440,30 +449,45 @@ class DLExperiment(Experiment):
                 if "y" in data:
                     loss_agg.update(self.loss_func(data, output))
 
-                idx_list.append(data["idx"].reshape(-1))
-                # 只聚合y_pred, 防止显存爆炸
-                output_list.append({"y_pred": output["y_pred"]})
+                idx_list.append(data["idx"].reshape(-1).detach().cpu())
+                y_pred_list.append(output["y_pred"].detach().cpu())
 
+            # 合并后将输出落盘以避免大矩阵的多机通信
             idx: torch.Tensor = torch.cat(idx_list, axis=0)
-            idx = self.accelerator.gather_for_metrics(idx)
+            y_pred: torch.Tensor = torch.cat(y_pred_list, axis=0)
+            torch.save(
+                {"idx": idx, "y_pred": y_pred},
+                os.path.join(
+                    self.folder,
+                    f"tmp_{self.accelerator.process_index}.pth",
+                )
+            )
+            self.accelerator.wait_for_everyone()
 
-            output: Dict[str, torch.Tensor] = {}
-            for k in output_list[0]:
-                output[k] = torch.cat(
-                    [output_list[i][k] for i in range(len(output_list))
-                ], axis=0)
-                output[k] = self.accelerator.gather_for_metrics(output[k])
+            if not self.accelerator.is_main_process:
+                return {}, loss_agg
+
+            # 读取并合并y_pred
+            idx_list = []
+            y_pred_list = []
+            
+            for i in range(self.accelerator.num_processes):
+                tmp: Dict[str, torch.Tensor] = torch.load(
+                    os.path.join(self.folder, f"tmp_{i}.pth")
+                )
+                idx_list.append(tmp["idx"])
+                y_pred_list.append(tmp["y_pred"])
+
+            idx = torch.cat(idx_list, axis=0)
+            y_pred = torch.cat(y_pred_list, axis=0)
 
             # 根据idx对output调整顺序和去重并放置到cpu中
             perm: torch.Tensor = torch.argsort(idx)
             idx_sorted: torch.Tensor = idx.index_select(0, perm)
-
             mask = torch.ones_like(idx_sorted, dtype=torch.bool)
-            mask[1:] = (idx_sorted[1:] != idx_sorted[:-1])
-
-            for k in output:
-                output[k] = output[k].index_select(0, perm[mask]).cpu()
-            return output, loss_agg
+            mask[1: ] = (idx_sorted[1: ] != idx_sorted[: -1])
+            y_pred = y_pred.index_select(0, perm[mask]).cpu()
+            return {"y_pred": y_pred}, loss_agg
 
     def export(self, model: nn.Module, ckpt: str | None = None) -> None:
         """

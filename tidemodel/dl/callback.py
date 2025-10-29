@@ -211,5 +211,6 @@ class RayTuneReport(Callback):
     def on_valid_end(self, exp: DLExperiment) -> None:
         if self._is_better(exp.metric[self.metric_name]):
             self.best_metric = exp.metric[self.metric_name]
-        
-        session.report({self.metric_name: self.best_metric})
+
+        if exp.is_main_process:
+            session.report({self.metric_name: self.best_metric})

@@ -3,6 +3,7 @@
 """
 
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from typing import Any, List, Tuple
 
 import h5py
@@ -194,28 +195,43 @@ class MinuteData:
 
 class HDF5Ndarray:
     """
-    由一组已经初始化好的h5py dataset构成的矩阵
-
+    由一组排好序的h5py文件名构成的矩阵
+    
+    维护一个句柄缓存池用于读取h5文件
+    
     和numpy矩阵一样支持索引返回numpy矩阵
     """
 
-    def __init__(self, datasets: List[h5py.Dataset]) -> None:
-        self.datasets: List[h5py.Dataset] = datasets
+    def __init__(self, files: List[str], n_cache: int = 2048) -> None:
+        self.files: List[str] = files
+        self.n_cache: int = n_cache
+
+        self.handles: OrderedDict = OrderedDict()
 
         # 每一个dataset的shape都是(1, n_minute, n_ticker, n_name)
-        self.shape: Tuple[int] = (
-            len(self.datasets), 
-        ) + self.datasets[0].shape[1: ]
+        self.shape: Tuple[int, ...] = (
+            len(self.files), 
+        ) + self.get_dataset(self.files[0]).shape[1: ]
+
+    def get_dataset(self, file: str) -> h5py.Dataset:
+        """
+        从缓存池中取出dataset
+        """
+        if file not in self.handles:
+            self.handles[file] = h5py.File(file, 'r', locking=False)
+            if len(self.handles) > self.n_cache:
+                _, handle = self.handles.popitem(last=False)
+                handle.close()
+        return self.handles[file]["x"]
 
     def __getitem__(self, slices: Any) -> np.ndarray | float:
         """
         和numpy矩阵完全一致的索引方法
         """
         if isinstance(slices[0], int):
-            return self.datasets[slices[0]][0, *slices[1: ]]
+            return self.get_dataset(self.files[slices[0]])[0, *slices[1: ]]
         else:
-            datasets: List[h5py.Dataset] = self.datasets[slices[0]]
-            data: List[float | np.ndarray] = [
-                dataset[0, *slices[1: ]] for dataset in datasets
-            ]
+            data: List[np.ndarray | float] = [self.get_dataset(file)[
+                0, *slices[1: ]
+            ] for file in self.files[slices[0]]]
             return np.stack(data, axis=0)

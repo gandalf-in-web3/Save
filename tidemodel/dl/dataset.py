@@ -77,6 +77,8 @@ class PreloadMinuteDataset(Dataset):
     尽量避免对矩阵有过多的操作, 原因如下:
     1. 矩阵占用内存高, 直接操作内存和耗时都会爆炸
     2. 在torch中使用gpu对小batch操作会更优
+
+    whole_x和whole_y是只读的
     """
 
     def __init__(
@@ -86,7 +88,6 @@ class PreloadMinuteDataset(Dataset):
         date_slice: slice = slice(None),
         minute_slice: slice = slice(None),
         seq_len: int | None = None,
-        cross_norm_y: bool = False,
     ) -> None:
         self.seq_len: int | None = seq_len
         self.x_names: List[str] = list(whole_x.names.data)
@@ -101,7 +102,6 @@ class PreloadMinuteDataset(Dataset):
             whole_y=whole_y,
             date_slice=date_slice,
             minute_slice=minute_slice,
-            cross_norm_y=cross_norm_y,
         )
 
     def _load_x_and_y(
@@ -110,17 +110,12 @@ class PreloadMinuteDataset(Dataset):
         whole_y: MinuteData,
         date_slice: slice = slice(None),
         minute_slice: slice = slice(None),
-        cross_norm_y: bool = False,
     ) -> None:
         """
         根据整个x和y矩阵计算y, y_pred和index
         """
         self.whole_x = whole_x
         self.whole_y = whole_y
-
-        if cross_norm_y:
-            self.whole_y = cross_norm(self.whole_y)
-
         self.y = self.whole_y[date_slice, minute_slice]
 
         # self.t_whole_y = copy.deepcopy(self.whole_y)
@@ -196,28 +191,26 @@ class LazyMinuteDataset(PreloadMinuteDataset):
     def __init__(
         self,
         hdf5_db: HDF5MinuteDataBase,
-        y_names: str | List[str],
+        whole_y: MinuteData,
         x_names: List[str] | slice = slice(None),
         date_slice: slice = slice(None),
         minute_slice: slice = slice(None),
         tickers: List[str] | slice = slice(None),
         seq_len: int | None = None,
-        cross_norm_y: bool = False,
     ) -> None:
         self.hdf5_db = hdf5_db
         self.x_names: List[str] | slice = (
             self.hdf5_db.names if x_names == slice(None)
             else x_names
         )
-        self.y_names: str | List[str] = y_names
+        self.y_names: np.ndarray = whole_y.names.data
         self.date_slice: slice = date_slice
         self.minute_slice: slice = minute_slice
         self.tickers: List[str] | slice = tickers
         self.seq_len: int | None = seq_len
-        self.cross_norm_y: bool = cross_norm_y
 
         self.whole_x: MinuteData = None
-        self.whole_y: MinuteData = None
+        self.whole_y: MinuteData = whole_y
         self.y: MinuteData = None
 
         self._load: bool = False
@@ -226,21 +219,24 @@ class LazyMinuteDataset(PreloadMinuteDataset):
         """
         初始化hdf5句柄, 加载数据
         """
-        whole_x, whole_y = self.hdf5_db.read_dataset_lazy(
-            self.y_names
+        whole_x = MinuteData(
+            dates=self.hdf5_db.dates,
+            minutes=self.whole_y.minutes.data,
+            tickers=self.whole_y.tickers.data,
+            names=np.array(self.hdf5_db.names),
+            data=self.hdf5_db.read_x_lazy(),
         )
         # hdf5数据库中的x可能存在与bin数据库中的y时间不匹配的问题
-        whole_y = whole_y[slice(
+        self.whole_y = self.whole_y[slice(
             whole_x.dates.data[0],
             whole_x.dates.data[-1] + np.timedelta64(1, 'D'),
         )]
 
         self._load_x_and_y(
             whole_x=whole_x,
-            whole_y=whole_y,
+            whole_y=self.whole_y,
             date_slice=self.date_slice,
             minute_slice=self.minute_slice,
-            cross_norm_y=self.cross_norm_y,
         )
 
         # 提前计算股票名和因子名索引
@@ -341,12 +337,14 @@ def get_preload_datasets(
             tickers=tickers,
         )
 
+    if cross_norm_y:
+        whole_y = cross_norm(whole_y)
+
     dataset_cls: Callable = partial(
         PreloadMinuteDataset,
         whole_x=whole_x,
         whole_y=whole_y,
         seq_len=seq_len,
-        cross_norm_y=cross_norm_y,
     )
     return get_datasets(
         dataset_cls=dataset_cls,
@@ -369,22 +367,48 @@ def get_lazy_datasets(
     tickers: slice | List[str] = slice(None),
     seq_len: int | None = None,
     cross_norm_y: bool = False,
+    clip_pct: float = 0.0,
 ) -> Tuple[Dataset, Dataset, Dataset]:
     """
     获取懒加载训练集. 验证集和测试集
     """
 
-    hdf5_db = HDF5MinuteDataBase(
-        hdf5_folder, bin_folder
+    bin_db = BinMinuteDataBase(bin_folder)
+    whole_y: MinuteData = bin_db.read_multi_data(
+        'y', y_names, n_worker=0
     )
+    if cross_norm_y:
+        whole_y = cross_norm(whole_y)
+
+    if clip_pct > 0.0: 
+        # 取出训练集对应的y
+        train_date_idx_slice: slice = whole_y.dates.index_range(
+            train_date_slice.start,
+            train_date_slice.stop,
+            train_date_slice.step
+        )
+        train_minute_idx_slice: slice = whole_y.minutes.index_range(
+            minute_slice.start, minute_slice.stop, minute_slice.step
+        )
+        train_y: np.ndarray = whole_y.data[
+            train_date_idx_slice, train_minute_idx_slice
+        ]
+
+        # 分label计算分位数并clip
+        lo, hi = np.nanpercentile(
+            train_y, [clip_pct, 1 - clip_pct], axis=-1, keepdims=True
+        )
+        whole_y.data[
+            train_date_idx_slice, train_minute_idx_slice
+        ] = np.clip(train_y, lo, hi)
+
     dataset_cls: Callable = partial(
         LazyMinuteDataset,
-        hdf5_db=hdf5_db,
+        hdf5_db=HDF5MinuteDataBase(hdf5_folder, bin_folder),
+        whole_y=whole_y,
         x_names=x_names,
-        y_names=y_names,
         tickers=tickers,
         seq_len=seq_len,
-        cross_norm_y=cross_norm_y,
     )
     return get_datasets(
         dataset_cls=dataset_cls,

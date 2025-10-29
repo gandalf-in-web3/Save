@@ -495,34 +495,14 @@ class HDF5MinuteDataBase:
                 except Exception as e:
                     print(f"Error {e}")
         return flatten_x, flatten_y
-        
-    def read_dataset_lazy(
-        self,
-        y_names: str | List[str],
-    ) -> Tuple[MinuteData, MinuteData]:
-        """
-        以懒加载模式读取数据集
-        """
-        # 读取y
-        y: MinuteData = self.bin_db.read_multi_data(
-            'y', y_names, n_worker=0
-        )
 
-        # 懒加载x, 将dataset组合成HDF5Ndarray
-        self.handles: List[h5py.File] = [
-            h5py.File(
-                os.path.join(self.folder, file), 'r', locking=False
-            ) for file in self.files
-        ]
-        
-        x = MinuteData(
-            dates=self.dates,
-            minutes=y.minutes.data,
-            tickers=y.tickers.data,
-            names=np.array(self.names),
-            data=HDF5Ndarray([handle["x"] for handle in self.handles]),
+    def read_x_lazy(self, ) -> HDF5Ndarray:
+        """
+        读取懒加载的x
+        """
+        return HDF5Ndarray(
+            [os.path.join(self.folder, file) for file in self.files]
         )
-        return x, y
 
 
 class StatsDataBase:

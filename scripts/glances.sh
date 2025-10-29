@@ -10,36 +10,19 @@ SESSION=${SESSION:-glances-nav}
 
 HOSTS=(
   "192.168.4.23" "192.168.4.35" "192.168.4.41" "192.168.4.42"
-  "192.168.4.43" "192.168.4.44" "192.168.4.55" "192.168.4.56"
-  "192.168.4.57" "192.168.4.58" "192.168.4.61" "192.168.4.62"
-  "192.168.4.63" "192.168.4.64" "192.168.4.65" "192.168.4.66"
-  "192.168.4.67" "192.168.4.68"
+  "192.168.4.43" "192.168.4.44" "192.168.4.48" "192.168.4.55"
+  "192.168.4.56" "192.168.4.57" "192.168.4.58" "192.168.4.61"
+  "192.168.4.62" "192.168.4.63" "192.168.4.64" "192.168.4.65"
+  "192.168.4.66" "192.168.4.67" "192.168.4.68"
 )
-
 
 # 启动glances服务端
 for h in "${HOSTS[@]}"; do
   printf "%-15s : " "$h"
-
-  # 远端一条命令搞定：先补 PATH，再判断是否已在跑，未跑就启动
-  if ! sshpass -p "$PASS" ssh -p "$PORT" \
-      -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-      -o LogLevel=ERROR -o ConnectTimeout=5 -n "${USER}@${h}" \
-      "cd /; export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\$PATH;
-       if pgrep -f 'glances.* -s' >/dev/null 2>&1 || \
-          (ss -ltn 2>/dev/null | grep -q ':${GLANCES_PORT}\b' || \
-           netstat -ltn 2>/dev/null | grep -q ':${GLANCES_PORT}\b'); then
-         echo already
-       else
-         nohup glances -s -B 0.0.0.0 >/dev/null 2>&1 &
-         sleep 1
-         pgrep -f 'glances.* -s' >/dev/null 2>&1 && echo started || echo failed
-       fi"
-  then
-    echo "unreachable"
-  fi
+  sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -T "${USER}@${h}" \
+    "nohup glances -s -B 0.0.0.0 -p $GLANCES_PORT >/dev/null 2>&1 &" \
+    && echo started || echo unreachable
 done
-
 
 # 启动glances监视
 usage() {
@@ -98,7 +81,7 @@ for hp in "${HOSTS[@]:1}"; do
 done
 
 # 体验优化：窗口标题=host；退出时保留窗口内容；状态栏更清晰
-tmux set-option  -t "$SESSION" remain-on-exit on
+tmux set-window-option -t "$SESSION" remain-on-exit on
 tmux set-option  -t "$SESSION" mouse on
 tmux set-option  -t "$SESSION" status on
 tmux set-option  -t "$SESSION" status-right '#[fg=colour247]#{session_name}  [#{window_index}+1/#{session_windows}]  %H:%M '
