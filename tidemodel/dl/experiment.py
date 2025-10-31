@@ -150,8 +150,8 @@ class DLExperiment(Experiment):
         self.valid_step: int = 0
         self.stop_train: bool = False
 
-        self.output: Dict[str, torch.Tensor] = {}
-        self.metric: Dict[str, torch.Tensor] = {}
+        self.output: Dict[str, torch.Tensor] = None
+        self.metric: Dict[str, torch.Tensor] = None
 
     def _record(self, value: Dict[str, Any], prefix: str) -> None:
         """
@@ -343,13 +343,13 @@ class DLExperiment(Experiment):
                     self.output, valid_loss_agg = self.predict(
                         self.valid_dataloader
                     )
-                    if self.accelerator.is_main_process:
+                    if self.accelerator.is_main_process: 
                         self.metric = self.metric_func(
                             self.valid_dataloader.dataset, self.output
                         )
 
                     # 将metric广播到各个节点
-                    payload = [self.metric] if self.accelerator.is_main_process else [None]
+                    payload = [self.metric]
                     broadcast_object_list(payload, from_process=0)
                     self.metric = payload[0]
 
