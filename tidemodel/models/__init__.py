@@ -1,9 +1,11 @@
 from .catboost import *
 
+from .lasso import *
+
 from .lgbm import *
 
-from .lgbm_ts import *
-
 from .mlp import *
+
+from .gfs import *
 
 from .gru import *

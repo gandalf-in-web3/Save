@@ -14,3 +14,15 @@ pidstat -d 1 -p $pid
 
 # 查看磁盘的挂载方式
 mount | grep data
+
+# 查看GPU之间的拓扑结构
+nvidia-smi topo -m
+
+# 查看GPU之间是否支持P2P通信
+nvidia-smi topo -p2p rw
+
+# 查看一台机器上有哪些网卡
+ip -br addr
+
+# 查看网卡的性能
+ethtool ib0

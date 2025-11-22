@@ -80,12 +80,12 @@ class EarlyStopSaver(Callback):
 
     def __init__(
         self,
-        metric_name: str,
         patience: int,
+        metric_name: str | None = None,
         mode: Literal["min", "max"] = "max",
         tol: float = 0.0,
     ) -> None:
-        self.metric_name: str = metric_name
+        self.metric_name: str | None = metric_name
         self.patience: int = patience
         self.mode: Literal["min", "max"] = mode
         self.tol: float = tol
@@ -111,8 +111,11 @@ class EarlyStopSaver(Callback):
         """
         在一次验证根据指标早停和保存模型
         """
-        if self._is_better(exp.metric[self.metric_name]):
-            self.best_metric = exp.metric[self.metric_name]
+        if (
+            (self.metric_name is None) or
+            self._is_better(exp.metric[self.metric_name])
+        ):
+            self.best_metric = exp.metric.get(self.metric_name, None)
 
             exp.logger.info(f"step {exp.step} new best model")
 

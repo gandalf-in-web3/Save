@@ -184,6 +184,8 @@ def get_mlp_model(
     x_norm_stats_file: str,
     model_cls: nn.Module = MLP,
     with_rank: bool = False,
+    with_lgb: bool = False,
+    lgb_bins: Dict[str, List[float]] | None = None,
 ) -> nn.Module:
     stats_db = StatsDataBase(x_norm_stats_file)
     x_min: np.ndarray = stats_db.get_stats("x_1", x_names)
@@ -197,4 +199,5 @@ def get_mlp_model(
         x_median=x_median,
         x_max=x_max,
         with_rank=with_rank,
+        lgb_bins=lgb_bins,
     )

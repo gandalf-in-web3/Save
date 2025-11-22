@@ -118,11 +118,6 @@ class PreloadMinuteDataset(Dataset):
         self.whole_y = whole_y
         self.y = self.whole_y[date_slice, minute_slice]
 
-        # self.t_whole_y = copy.deepcopy(self.whole_y)
-        # self.t_whole_y[date_slice, minute_slice].data = t_cross_norm(
-        #     self.t_whole_y[date_slice, minute_slice]
-        # ).data
-
         date_idx_slice: slice = self.whole_y.dates.index_range(
             date_slice.start, date_slice.stop, date_slice.step
         )

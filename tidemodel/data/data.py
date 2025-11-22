@@ -202,11 +202,13 @@ class HDF5Ndarray:
     和numpy矩阵一样支持索引返回numpy矩阵
     """
 
-    def __init__(self, files: List[str], n_cache: int = 2048) -> None:
+    def __init__(self, files: List[str], n_cache: int = 512) -> None:
         self.files: List[str] = files
         self.n_cache: int = n_cache
 
         self.handles: OrderedDict = OrderedDict()
+        for file in self.files:
+            self.handles[file] = h5py.File(file, 'r', locking=False)
 
         # 每一个dataset的shape都是(1, n_minute, n_ticker, n_name)
         self.shape: Tuple[int, ...] = (

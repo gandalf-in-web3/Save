@@ -5,19 +5,21 @@
 import copy
 import logging
 import os
+import random
 import shutil
 from collections import defaultdict
 from typing import Any, Dict, List, Tuple
 
 import accelerate
+from scipy.stats import skew
 import torch
 import numpy as np
 import torch.onnx as onnx
 from accelerate import Accelerator
-from accelerate.utils import broadcast_object_list
 from torch import nn
 from torch.optim import Optimizer
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 
@@ -67,6 +69,7 @@ class DLExperiment(Experiment):
 
     params: Dict[str, Any] = {
         "seed": 42,
+        "resume": False,
 
         "lr": 0.001,
         "weight_decay": 0.0,
@@ -214,20 +217,41 @@ class DLExperiment(Experiment):
         output: Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
         """
-        计算指标
-
-        返回一个metric字典
-
-        默认使用整体ic作为评估指标
+        返回整体IC, 前30分钟和前90分钟IC
         """
-        if hasattr(self.get_model(), "metric_func"):
-            return self.get_model().metric_func(self, dataset, output)
-        
-        y_pred: MinuteData = copy.copy(dataset.y)
-        y_pred.data = output["y_pred"].detach().numpy().reshape(
+        first_y: MinuteData = copy.copy(dataset.y)
+        first_y.data = dataset.y.data[:, :, :, 0: 1]
+        first_y.names = UniqueIndex(dataset.y.names.data[0: 1])
+
+        first_y_pred: MinuteData = copy.copy(first_y)
+        first_y_pred.data = output["y_pred"].detach().numpy().reshape(
             dataset.y.shape
+        )[:, :, :, 0: 1]
+
+        # 计算横截面IC
+        cross_ics: np.ndarray = cross_ic(
+            first_y, first_y_pred, mean=False
         )
-        return {"cross_ic": cross_ic(dataset.y, y_pred)}
+        _cross_ic: float = np.nanmean(cross_ics)
+        min30_idx_slice: slice = first_y.minutes.index_range(None, 30)
+        _cross_ic30: float = np.nanmean(cross_ics[:, min30_idx_slice])
+        min90_idx_slice: slice = first_y.minutes.index_range(None, 90)
+        _cross_ic90: float = np.nanmean(cross_ics[:, min90_idx_slice])
+        
+        # 计算横截面rank IC
+        _cross_rank_ic: float = cross_ic(
+            first_y, first_y_pred, rank=True
+        )
+
+        return {
+            "cross_ic": _cross_ic,
+            "cross_ic30": _cross_ic30,
+            "cross_ic90": _cross_ic90,
+            "cross_rank_ic": _cross_rank_ic,
+            "avg_ic": (_cross_ic + _cross_rank_ic) / 2.0,
+            # 计算预测值的偏度，用于多空是否对称
+            "skew": skew(first_y_pred.data.flatten()),
+        }
 
     def train(
         self,
@@ -240,6 +264,15 @@ class DLExperiment(Experiment):
         torch.cuda.empty_cache()
 
         self.model = model
+        if self.params["resume"]:
+            ckpt = get_newest_ckpt(self.folder)
+            self.step = int(ckpt.split("_")[-1].split(".")[0])
+
+            state = torch.load(os.path.join(
+                self.folder, ckpt
+            ), map_location="cpu")
+            self.model.load_state_dict(state, strict=True)
+
         self.optimizer = optimizer
         if self.optimizer is None:
             self.optimizer = torch.optim.AdamW(
@@ -252,7 +285,7 @@ class DLExperiment(Experiment):
             "batch_size": self.params["batch_size"],
             "collate_fn": collate_fn,
             "num_workers": self.params["n_worker"],
-            "pin_memory": True,
+            # "pin_memory": True,
         }
         # 对于rdma挂载不预取更稳定
         if dataloader_config["num_workers"] > 0:
@@ -334,6 +367,8 @@ class DLExperiment(Experiment):
 
                 self.step += 1
                 self.callback.run("on_train_step_end")
+                if hasattr(self.get_model(), "on_train_step_end"):
+                    self.get_model().on_train_step_end(self)
 
                 # 验证
                 if self.step % self.valid_step == 0:
@@ -343,15 +378,9 @@ class DLExperiment(Experiment):
                     self.output, valid_loss_agg = self.predict(
                         self.valid_dataloader
                     )
-                    if self.accelerator.is_main_process: 
-                        self.metric = self.metric_func(
-                            self.valid_dataloader.dataset, self.output
-                        )
-
-                    # 将metric广播到各个节点
-                    payload = [self.metric]
-                    broadcast_object_list(payload, from_process=0)
-                    self.metric = payload[0]
+                    self.metric = self.metric_func(
+                        self.valid_dataloader.dataset, self.output
+                    )
 
                     # 记录
                     self._record(train_loss_agg.loss, prefix="train")
@@ -362,6 +391,8 @@ class DLExperiment(Experiment):
                     self.callback.run("on_valid_end")
 
             self.callback.run("on_epoch_end")
+            if hasattr(self.get_model(), "on_epoch_end"):
+                self.get_model().on_epoch_end(self)
 
         self.callback.run("on_train_end")
 
@@ -385,7 +416,7 @@ class DLExperiment(Experiment):
             "batch_size": self.params["batch_size"],
             "collate_fn": collate_fn,
             "num_workers": self.params["n_worker"],
-            "pin_memory": True,
+            # "pin_memory": True,
         }
         # 对于rdma挂载不预取更稳定
         if dataloader_config["num_workers"] > 0:
@@ -425,21 +456,19 @@ class DLExperiment(Experiment):
     def predict(
         self,
         dataloader: DataLoader,
-    ) -> Tuple[Dict[str, torch.Tensor], LossAggregator]:
+    ) -> Tuple[torch.Tensor, LossAggregator]:
         """
         对指定dataloader推理得到输出和聚合loss
 
         如果数据中不包含y则聚合loss为None
-
-        只聚合y_pred, 防止显存爆炸
         """
         self.model.eval()
 
         loss_agg = LossAggregator()
         idx_list: List[torch.Tensor] = []
-        y_pred_list: List[torch.Tensor] = []
+        output_list: List[Dict[str, torch.Tensor]] = []
 
-        with torch.inference_mode():
+        with torch.no_grad():
             for data in tqdm(
                 dataloader,
                 disable=not self.accelerator.is_main_process,
@@ -449,45 +478,29 @@ class DLExperiment(Experiment):
                 if "y" in data:
                     loss_agg.update(self.loss_func(data, output))
 
-                idx_list.append(data["idx"].reshape(-1).detach().cpu())
-                y_pred_list.append(output["y_pred"].detach().cpu())
+                idx_list.append(data["idx"].reshape(-1))
+                # 只聚合y_pred, 防止显存爆炸
+                output_list.append({"y_pred": output["y_pred"]})
 
-            # 合并后将输出落盘以避免大矩阵的多机通信
             idx: torch.Tensor = torch.cat(idx_list, axis=0)
-            y_pred: torch.Tensor = torch.cat(y_pred_list, axis=0)
-            torch.save(
-                {"idx": idx, "y_pred": y_pred},
-                os.path.join(
-                    self.folder,
-                    f"tmp_{self.accelerator.process_index}.pth",
-                )
-            )
-            self.accelerator.wait_for_everyone()
+            idx = self.accelerator.gather_for_metrics(idx)
 
-            if not self.accelerator.is_main_process:
-                return {}, loss_agg
-
-            # 读取并合并y_pred
-            idx_list = []
-            y_pred_list = []
-            
-            for i in range(self.accelerator.num_processes):
-                tmp: Dict[str, torch.Tensor] = torch.load(
-                    os.path.join(self.folder, f"tmp_{i}.pth")
-                )
-                idx_list.append(tmp["idx"])
-                y_pred_list.append(tmp["y_pred"])
-
-            idx = torch.cat(idx_list, axis=0)
-            y_pred = torch.cat(y_pred_list, axis=0)
+            output: Dict[str, torch.Tensor] = {}
+            for k in output_list[0]:
+                output[k] = torch.cat(
+                    [output_list[i][k] for i in range(len(output_list))
+                ], axis=0)
+                output[k] = self.accelerator.gather_for_metrics(output[k])
 
             # 根据idx对output调整顺序和去重并放置到cpu中
             perm: torch.Tensor = torch.argsort(idx)
             idx_sorted: torch.Tensor = idx.index_select(0, perm)
             mask = torch.ones_like(idx_sorted, dtype=torch.bool)
-            mask[1: ] = (idx_sorted[1: ] != idx_sorted[: -1])
-            y_pred = y_pred.index_select(0, perm[mask]).cpu()
-            return {"y_pred": y_pred}, loss_agg
+            mask[1:] = (idx_sorted[1:] != idx_sorted[:-1])
+
+            for k in output:
+                output[k] = output[k].index_select(0, perm[mask]).cpu()
+            return output, loss_agg
 
     def export(self, model: nn.Module, ckpt: str | None = None) -> None:
         """
@@ -539,35 +552,164 @@ class DLExperiment(Experiment):
             self.writer.close()
 
 
-class MinuteDLExperiment(DLExperiment):
+class DDPDLExperiment(DLExperiment):
     """
-    针对一分钟频的深度学习实验基类
+    DDP实验, 将数据固定分块到不同的节点上, 充分利用缓存
+
+    目前实现的版本具有严格的限制, 多台机器的gpu数必须完全一致且全部使用
     """
 
-    def metric_func(
+    def train(
         self,
-        dataset: Dataset,
-        output: Dict[str, torch.Tensor],
-    ) -> Dict[str, torch.Tensor]:
+        model: nn.Module,
+        optimizer: Optimizer | None = None,
+    ) -> None:
         """
-        返回整体IC, 前30分钟和前90分钟IC
+        训练
         """
-        first_y: MinuteData = copy.copy(dataset.y)
-        first_y.data = dataset.y.data[:, :, :, 0: 1]
-        first_y.names = UniqueIndex(dataset.y.names.data[0: 1])
+        torch.cuda.empty_cache()
 
-        first_y_pred: MinuteData = copy.copy(first_y)
-        first_y_pred.data = output["y_pred"].detach().numpy().reshape(
-            dataset.y.shape
-        )[:, :, :, 0: 1]
+        self.model = model
+        if self.params["resume"]:
+            ckpt = get_newest_ckpt(self.folder)
+            state = torch.load(os.path.join(
+                self.folder, ckpt
+            ), map_location="cpu")
+            self.model.load_state_dict(state, strict=True)
 
-        cross_ics: np.ndarray = cross_ic(
-            first_y, first_y_pred, mean=False
-        )
-        min30_idx_slice: slice = first_y.minutes.index_range(None, 30)
-        min90_idx_slice: slice = first_y.minutes.index_range(None, 90)
-        return {
-            "cross_ic": np.mean(cross_ics),
-            "cross_ic30": np.mean(cross_ics[:, min30_idx_slice]),
-            "cross_ic90": np.mean(cross_ics[:, min90_idx_slice]),
+        self.optimizer = optimizer
+        if self.optimizer is None:
+            self.optimizer = torch.optim.AdamW(
+                self.model.parameters(),
+                lr=self.params["lr"],
+                weight_decay=self.params["weight_decay"],
+            )
+
+        # 将训练集按照不同的机器切分
+        state = self.accelerator.state
+        assert state.num_processes > 1
+        # num_machines: int = state.num_processes // torch.cuda.device_count()
+        # machine_rank: int = state.process_index // torch.cuda.device_count()
+
+        # 计算每个进程的训练数据索引, 先打乱再切片
+        all_indices: List[int] = list(range(len(self.train_dataset)))
+        random.shuffle(all_indices)
+
+        per_process: int = len(all_indices) // state.num_processes 
+        start: int = state.process_index * per_process
+        end: int = (state.process_index + 1) * per_process
+        self.train_dataset = Subset(self.train_dataset, all_indices[start: end])
+        print(f"process {state.process_index}, data {start}-{end}")
+
+        dataloader_config: Dict[str, Any] = {
+            "batch_size": self.params["batch_size"],
+            "collate_fn": collate_fn,
+            "num_workers": self.params["n_worker"],
+            # "pin_memory": True,
         }
+        # 不预取更稳定
+        if dataloader_config["num_workers"] > 0:
+            dataloader_config["prefetch_factor"] = 1
+            dataloader_config["persistent_workers"] = True
+
+        # 本机内部按照GPU划分
+        self.train_dataloader = DataLoader(
+            self.train_dataset,
+            shuffle=True,
+            drop_last=True,
+            **dataloader_config,
+        )
+
+        self.valid_dataloader = DataLoader(
+            self.valid_dataset,
+            **dataloader_config,
+        )
+
+        # accelerator处理变量
+        (
+            self.model,
+            self.optimizer,
+            self.valid_dataloader
+        ) = (
+            self.accelerator.prepare(
+                self.model,
+                self.optimizer,
+                self.valid_dataloader,
+            )
+        )
+
+        self.valid_step = len(
+            self.train_dataloader
+        ) // self.params["n_valid_per_epoch"]
+
+        train_loss_agg = LossAggregator()
+
+        self.callback.run("on_train_start")
+
+        # 训练循环
+        for e in tqdm(
+            range(self.params["epoch"]),
+            disable=not self.accelerator.is_main_process,
+        ):
+            # 终止训练
+            if self.stop_train:
+                break
+
+            self.epoch = e
+            self.callback.run("on_epoch_start")
+
+            for data in tqdm(
+                self.train_dataloader,
+                disable=not self.accelerator.is_main_process,
+            ):
+                # 终止训练
+                if self.stop_train:
+                    break
+
+                self.model.train()
+                self.callback.run("on_train_step_start")
+
+                # 正向
+                data = {k: v.to(
+                    self.accelerator.device, non_blocking=True
+                ) for k, v in data.items()}
+                output: Dict[str, torch.Tensor] = self.model(data)
+                loss: Dict[str, torch.Tensor] = self.loss_func(data, output)
+                train_loss_agg.update(loss)
+                
+                self.accelerator.backward(loss["loss"])
+                if self.params["clip_norm"] != float("inf"):
+                    self.accelerator.clip_grad_norm_(
+                        self.model.parameters(), self.params["clip_norm"],
+                    )
+
+                # 反向
+                self.optimizer.step()
+                self.optimizer.zero_grad()
+
+                self.step += 1
+                self.callback.run("on_train_step_end")
+
+                # 验证
+                if self.step % self.valid_step == 0:
+                    self.callback.run("on_valid_start")
+
+                    # 正向
+                    self.output, valid_loss_agg = self.predict(
+                        self.valid_dataloader
+                    )
+                    self.metric = self.metric_func(
+                        self.valid_dataloader.dataset, self.output
+                    )
+
+                    # 记录
+                    self._record(train_loss_agg.loss, prefix="train")
+                    train_loss_agg.reset()
+                    self._record(valid_loss_agg.loss, prefix="valid")
+                    self._record(self.metric, prefix="valid")
+
+                    self.callback.run("on_valid_end")
+
+            self.callback.run("on_epoch_end")
+
+        self.callback.run("on_train_end")

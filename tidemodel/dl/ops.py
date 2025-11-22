@@ -98,6 +98,75 @@ def cross_ic_loss(
     return -cross_ic(y, y_pred, dim=dim)
 
 
+def soft_rank(
+    x: torch.Tensor,
+    n_bins: int = 4800,
+    temp: float = 1e-4,
+) -> torch.Tensor:
+    """
+    通过softmax近似的可导rank
+    """
+
+    assert x.ndim == 1
+    if x.numel() == 0:
+        return x
+
+    # 计算等频分箱分位数点
+    quantiles = torch.linspace(0, 1, n_bins + 1, device=x.device)[1: -1]
+    bin_edges = torch.quantile(x.detach(), quantiles)
+
+    # 添加最小值和最大值
+    min_val = x.min()
+    max_val = x.max()
+    bin_edges = torch.cat([min_val.unsqueeze(0), bin_edges, max_val.unsqueeze(0)])
+    
+    # 计算每个点到所有边界的距离
+    diffs = x.unsqueeze(1) - bin_edges.unsqueeze(0)
+    
+    # 使用softmax计算每个点属于每个区间的概率
+    probs = torch.softmax(-diffs.abs() / temp, dim=1)
+
+    # 计算每个点的软秩次
+    bin_indices = torch.arange(n_bins + 1, device=x.device).float()
+    soft_ranks = (probs * bin_indices).sum(dim=1)
+
+    # 归一化到[0, 1]范围
+    soft_ranks = soft_ranks / n_bins
+    return soft_ranks
+
+
+def cross_rank_ic_loss(
+    y: torch.Tensor,
+    y_pred: torch.Tensor,
+    n_bins: int = 4800,
+    temp: float = 1e-4,
+) -> torch.Tensor:
+    """
+    计算两个tensor之间的近似横截面rank ic损失函数
+
+    y的形状为两维度, 最后一维rank ic的一个序列
+
+    自动忽略nan
+    """
+
+    assert y.ndim == 2
+    assert y.shape == y_pred.shape
+
+    loss: torch.Tensor = 0
+    mask: torch.Tensor = ~torch.isnan(y)
+
+    for i in range(y.shape[0]):
+        _y: torch.Tensor = y[i][mask[i]]
+        _y_pred: torch.Tensor = y_pred[i][mask[i]]
+
+        _y = soft_rank(_y, n_bins=n_bins, temp=temp)
+        _y_pred = soft_rank(_y_pred, n_bins=n_bins, temp=temp)
+        loss += cross_ic_loss(_y, _y_pred, dim=-1)
+
+    loss = loss / y.shape[0]
+    return loss
+
+
 def emd_loss(
     y: torch.Tensor,
     y_pred: torch.Tensor,
@@ -219,3 +288,26 @@ def nanmedian(
         vals = vals.squeeze(dim)
         idxs = idxs.squeeze(dim)
     return vals, idxs
+
+
+def skew_loss(
+    x: torch.Tensor,
+    dim: int = -1,
+    target: float = 0.0,
+    p: int = 2,
+) -> torch.Tensor:
+    """
+    计算在dim维度上的偏度损失, 默认通过mean聚合
+    """
+
+    mean: torch.Tensor = x.mean(dim=dim, keepdim=True)
+    diff: torch.Tensor = x - mean
+    var: torch.Tensor = (diff ** 2).mean(dim=dim, keepdim=True)
+    std: torch.Tensor = (var + 1e-8).sqrt()
+    skew = (diff / std).pow(3).mean(dim=dim)
+
+    if p == 1:
+        skew_loss = (skew - target).abs().mean()
+    else:
+        skew_loss = (skew - target).pow(2).mean()
+    return skew_loss

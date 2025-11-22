@@ -4,6 +4,7 @@
 
 import cupy as cp
 import numpy as np
+from scipy.stats import spearmanr
 
 from .data import MinuteData
 
@@ -12,9 +13,9 @@ from .data import MinuteData
 Numpy相关计算函数
 """
 
-def np_ic(x1: np.ndarray, x2: np.ndarray) -> float:
+def np_ic(x1: np.ndarray, x2: np.ndarray, rank: bool = False) -> float:
     """
-    计算两个一维序列的皮尔逊相关系数
+    计算两个一维序列的相关系数
 
     自动忽略nan
     """
@@ -23,13 +24,19 @@ def np_ic(x1: np.ndarray, x2: np.ndarray) -> float:
     assert x2.shape == x1.shape
 
     mask: np.ndarray = np.isfinite(x1) & np.isfinite(x2)
-    return np.corrcoef(x1[mask], x2[mask])[0, 1]
+
+    if rank:
+        rank_ic, _ = spearmanr(x1[mask], x2[mask])
+        return rank_ic
+    else:
+        return np.corrcoef(x1[mask], x2[mask])[0, 1]
 
 
 def np_long_ic(
     x1: np.ndarray,
     x2: np.ndarray,
     mean: bool = True,
+    rank: bool = False,
 ) -> float | np.ndarray:
     """
     计算两个多维矩阵的皮尔逊相关系数
@@ -43,7 +50,11 @@ def np_long_ic(
 
     ics: np.ndarray = np.zeros(x1.shape[-1], dtype=np.float32)
     for idx in range(x1.shape[-1]):
-        ics[idx] = np_ic(x1[..., idx].reshape(-1), x2[..., idx].reshape(-1))
+        ics[idx] = np_ic(
+            x1[..., idx].reshape(-1),
+            x2[..., idx].reshape(-1),
+            rank=rank,
+        )
 
     if mean:
         return np.nanmean(ics)
@@ -54,6 +65,7 @@ def np_cross_ic(
     x1: np.ndarray,
     x2: np.ndarray,
     mean: bool = True,
+    rank: bool = False,
 ) -> float | np.ndarray:
     """
     计算两个多维矩阵的皮尔逊相关系数
@@ -67,7 +79,7 @@ def np_cross_ic(
 
     ics: np.ndarray = np.zeros(x1.shape[: -1], dtype=np.float32)
     for idx in np.ndindex(x1.shape[:-1]):
-        ics[idx] = np_ic(x1[idx], x2[idx])
+        ics[idx] = np_ic(x1[idx], x2[idx], rank=rank)
 
     if mean:
         return np.nanmean(ics)
@@ -107,6 +119,7 @@ MinuteData相关计算函数
 def ic(
     x1: MinuteData,
     x2: MinuteData,
+    rank: bool = False,
 ) -> float:
     """
     计算两个分钟频数据的整体ic
@@ -114,6 +127,7 @@ def ic(
     return np_ic(
         x1=x1.data.reshape(-1),
         x2=x2.data.reshape(-1),
+        rank=rank,
     )
 
 
@@ -121,6 +135,7 @@ def long_ic(
     x1: MinuteData,
     x2: MinuteData,
     mean: bool = True,
+    rank: bool = False,
 ) -> np.ndarray | float:
     """
     计算两个分钟频数据的时序IC
@@ -132,6 +147,7 @@ def long_ic(
         x1=x1.data.squeeze(-1),
         x2=x2.data.squeeze(-1),
         mean=mean,
+        rank=rank,
     )
 
 
@@ -139,6 +155,7 @@ def cross_ic(
     x1: MinuteData,
     x2: MinuteData,
     mean: bool = True,
+    rank: bool = False,
 ) -> np.ndarray | float:
     """
     计算两个分钟频数据的截面IC
@@ -151,6 +168,7 @@ def cross_ic(
         x1=x1.data.squeeze(-1),
         x2=x2.data.squeeze(-1),
         mean=mean,
+        rank=rank,
     )
 
 

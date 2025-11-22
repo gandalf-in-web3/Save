@@ -74,7 +74,7 @@ trap 'cleanup; exit 130' INT TERM
 # -------- 启动 worker（后台无输出）--------
 for ((i=1;i<NMACH;i++)); do
   host="${machines[$i]}"
-  cmd=(accelerate launch
+  cmd=(NCCL_SOCKET_IFNAME=ib0 accelerate launch
        --num_processes "$NPROC"
        --num_machines "$NMACH"
        --machine_rank "$i"
@@ -91,9 +91,16 @@ for ((i=1;i<NMACH;i++)); do
     nohup setsid bash -lc \"$remote_cmd\" >>\"\$log\" 2>&1 & echo \$! >\"\$pid\"" &
 done
 
+# 同时在本机跟随所有 worker 的日志（后台），带前缀区分
+for ((i=1;i<NMACH;i++)); do
+  host="${machines[$i]}"
+  ssh -o BatchMode=yes -o StrictHostKeyChecking=no "${REMOTE_USER}@${host}" \
+    "tail -n +1 -F /tmp/${RUN_ID}_${i}.log" | sed -u "s/^/[rank ${i}@${host}] /" &
+done
+
 # -------- 启动 master（前台显示进度条）--------
 master="${machines[0]}"
-cmd0=(accelerate launch
+cmd0=(NCCL_SOCKET_IFNAME=ib0 accelerate launch
       --num_processes "$NPROC"
       --num_machines "$NMACH"
       --machine_rank 0
@@ -114,3 +121,5 @@ ssh -o BatchMode=yes -o StrictHostKeyChecking=no "${REMOTE_USER}@${master}" \
 
 # 正常结束就退出；如 Ctrl-C，会走 trap 清理
 echo "[ddp.sh] done."
+
+sleep 60
