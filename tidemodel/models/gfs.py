@@ -28,13 +28,11 @@ class GumbelSigmoidGate(nn.Module):
         min_tau: float = 0.1,
         alpha: float = 0.9,
         keep_ratio: float = 0.03,
-        threshold: float = 0.5,
     ) -> None:
         super().__init__()
 
         self.tau: float = tau
         self.min_tau: float = min_tau
-        self.threshold: float = threshold
         self.alpha: float = alpha
         self.keep_ratio: float = keep_ratio
 
@@ -182,19 +180,15 @@ class GFS(nn.Module):
         output: Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
         ic_loss = cross_ic_loss(data["y"], output["y_pred"], dim=-2)
-        bimodal_loss: torch.Tensor = (
-            output["mask"] * (1 - output["mask"])
-        ).mean()
 
         if self.gate.hard:
-            lambda_loss: torch.Tensor = torch.zeros_like(bimodal_loss)
+            lambda_loss: torch.Tensor = torch.zeros_like(output["mask"].mean())
         else:
             lambda_loss = torch.relu(output["mask"].mean() - self.keep_ratio)
 
         return {
-            "loss": ic_loss + 0.5 * bimodal_loss + 0.2 * lambda_loss,
+            "loss": ic_loss + 0.2 * lambda_loss,
             "ic_loss": ic_loss,
-            "bimodal_loss": bimodal_loss,
             "lambda_loss": lambda_loss,
         }
 
